@@ -126,11 +126,12 @@ pub fn supported_extensions() -> String {
     let exts = [
         "docx", "dotx", "docm", "dotm", "pptx", "potx", "ppsx", "pptm", "potm", "ppsm", "md",
         "txt", "text", "qmd", "rmd", "html", "htm", "xhtml", "xml", "nxml", "dclg", "dclx", "adoc",
-        "asciidoc", "asc", "csv", "tsv", "xlsx", "xlsm", "xlsb", "odt", "ott", "ods", "ots", "odp",
-        "otp", "sxw", "stw", "sxg", "sxc", "stc", "sxi", "sti", "fodt", "fods", "fodp", "json",
-        "sdw", "sda", "sdd", "vor", "abw", "zabw", "awt", "dbf", "dif", "slk", "sylk", "wk1",
-        "wk2", "wk3", "wk4", "wks", "wrk", "123", "vtt", "tex", "latex", "eml", "epub", "mhtml",
-        "mht", "rtf", "vsdx", "vsdm", "pdf",
+        "asciidoc", "asc", "csv", "tsv", "xlsx", "xlsm", "xlsb", "xltx", "xltm", "odt", "ott",
+        "ods", "ots", "odp", "otp", "sxw", "stw", "sxg", "sxc", "stc", "sxi", "sti", "fodt",
+        "fods", "fodp", "json", "sdw", "sda", "sdd", "vor", "abw", "zabw", "awt", "wpd", "wp",
+        "wp5", "wp6", "wpt", "wps", "dbf", "dif", "slk", "sylk", "wk1", "wk2", "wk3", "wk4", "wks",
+        "wrk", "123", "wq1", "wq2", "wb1", "wb2", "wb3", "qpw", "xlr", "vtt", "tex", "latex",
+        "eml", "epub", "mhtml", "mht", "rtf", "vsdx", "vsdm", "pdf",
     ];
     serde_json::to_string(exts.as_slice()).expect("static array serializes")
 }
@@ -206,7 +207,7 @@ mod tests {
         // A real corpus DOCX through the wasm entry path on the host.
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../docling/tests/data/docx/sources/docx_lists.docx"
+            "/../../tests/data/docx/sources/docx_lists.docx"
         ))
         .expect("corpus docx");
         let out = convert_impl(&bytes, "docx_lists.docx", None, None, None).unwrap();
@@ -220,7 +221,7 @@ mod tests {
     fn embedded_images_inline_as_data_uris() {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../docling/tests/data/docx/sources/word_image_anchors.docx"
+            "/../../tests/data/docx/sources/word_image_anchors.docx"
         ))
         .expect("corpus docx with images");
         let placeholder =

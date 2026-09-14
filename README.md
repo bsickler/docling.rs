@@ -59,12 +59,12 @@ docling's `FormatToExtensions`):
 
 | Category | Extensions |
 |---|---|
-| Text & markup | `.md` `.txt` `.text` `.qmd` `.rmd` · AsciiDoc `.adoc` `.asciidoc` `.asc` · HTML `.html` `.htm` `.xhtml` · MHTML `.mhtml` `.mht` · LaTeX `.tex` `.latex` |
-| Word processing | DOCX `.docx` `.docm` `.dotx` `.dotm` · Word 97–2004 `.doc` `.dot` · OpenDocument `.odt` `.ott` (flat `.fodt`) · OpenOffice 1.x `.sxw` `.stw` `.sxg` · StarWriter 3–5 `.sdw` `.vor` · AbiWord `.abw` `.zabw` `.awt` · EPUB `.epub` · RTF `.rtf` |
+| Text & markup | `.md` `.txt` `.text` `.qmd` `.rmd` · AsciiDoc `.adoc` `.asciidoc` `.asc` · HTML `.html` `.htm` `.xhtml` (any charset: BOM, declared `<meta charset>`, UTF-8, windows-1252 fallback) · MHTML `.mhtml` `.mht` · LaTeX `.tex` `.latex` |
+| Word processing | DOCX `.docx` `.docm` `.dotx` `.dotm` · Word 97–2004 `.doc` `.dot` · OpenDocument `.odt` `.ott` (flat `.fodt`) · OpenOffice 1.x `.sxw` `.stw` `.sxg` · StarWriter 3–5 `.sdw` `.vor` · AbiWord `.abw` `.zabw` `.awt` · WordPerfect 5.x/6.x+ `.wpd` `.wp` `.wp5` `.wp6` `.wpt` · Microsoft Works 2–9 `.wps` · EPUB `.epub` · RTF `.rtf` |
 | Presentations | PPTX `.pptx` `.pptm` `.potx` `.potm` `.ppsx` `.ppsm` · PowerPoint 97–2003 `.ppt` `.pot` `.pps` · OpenDocument `.odp` `.otp` (flat `.fodp`) · OpenOffice 1.x `.sxi` `.sti` · StarImpress/StarDraw 3–5 `.sdd` `.sda` |
 | Diagrams | Visio `.vsdx` `.vsdm` — pages as sections, shape text in reading order, connectors as a relations table · SVG `.svg` — rasterized (resvg) into the image ML pipeline; without ML or with `--no-ocr`, `<text>` elements extract directly into reading-order paragraphs |
-| Spreadsheets | XLSX `.xlsx` `.xlsm` · binary XLSB `.xlsb` · Excel 97–2004 `.xls` `.xlt` · OpenDocument `.ods` `.ots` (flat `.fods`) · OpenOffice 1.x `.sxc` `.stc` · CSV `.csv` `.tsv` · dBase `.dbf` · DIF `.dif` · SYLK `.slk` `.sylk` · Lotus 1-2-3 / Symphony `.wk1` `.wk2` `.wk3` `.wk4` `.wks` `.wrk` `.123` · MS Works `.wks` |
-| Apple iWork | Pages `.pages` · Numbers `.numbers` · Keynote `.key` — Pages mirrors docling's reader (#318): both generations (2013+ `Index/*.iwa` and iWork '09 `index.xml`), title/heading labels from paragraph styles, tables as grids, byte-identical Markdown; Numbers/Keynote are text-level extensions (#213): slide text, sheet/table names + cell text |
+| Spreadsheets | XLSX `.xlsx` `.xlsm` (templates `.xltx` `.xltm`) · binary XLSB `.xlsb` · Excel 97–2004 `.xls` `.xlt` · OpenDocument `.ods` `.ots` (flat `.fods`) · OpenOffice 1.x `.sxc` `.stc` · CSV `.csv` `.tsv` · dBase `.dbf` · DIF `.dif` · SYLK `.slk` `.sylk` · Lotus 1-2-3 / Symphony `.wk1` `.wk2` `.wk3` `.wk4` `.wks` `.wrk` `.123` · Quattro Pro `.wq1` `.wq2` `.wb1` `.wb2` `.wb3` `.qpw` · MS Works 6–9 `.xlr` · MS Works `.wks` |
+| Apple iWork | Pages `.pages` · Numbers `.numbers` · Keynote `.key` — Pages mirrors docling's reader (#318, #383): both generations (2013+ `Index/*.iwa` and iWork '09 `index.xml`), title/heading labels from paragraph styles, tables in the text flow, text boxes, lists, inline images, bold/italic/strike/links, headers/footers/footnotes (furniture) and reviewer comments (notes), byte-identical Markdown on upstream's corpus; Numbers/Keynote are text-level extensions (#213): slide text, sheet/table names + cell text |
 | XML dialects | JATS / USPTO / XBRL (`.xml` `.nxml`, content-sniffed) · DocLang `.dclg` |
 | PDF & images | `.pdf` · `.png` `.jpg` `.jpeg` `.tif` `.tiff` `.bmp` `.webp` `.gif` · HEIC/HEIF `.heic` `.heif` (opt-in `--features heif`, links the system libheif — #211) · METS/GBS scan packages `.tar.gz` |
 | docling native | docling JSON `.json` · DocTags `.doctags` `.dt` · DCLX `.dclx` |
@@ -76,12 +76,14 @@ docling's `FormatToExtensions`):
 Raw **DocTags** (`.doctags`/`.dt` — the token markup docling's VLMs emit) reads
 in through `docling-core`'s tolerant DocTags parser (#152), the same one the
 VLM pipeline uses for model responses.
-MHTML is a docling.rs-only extension (docling has no MHTML
-backend): saved-webpage `.mhtml`/`.mht` archives are parsed as a MIME message
-with [`mail-parser`](https://crates.io/crates/mail-parser) (which conforms to
-[RFC 2557](https://datatracker.ietf.org/doc/html/rfc2557), the MHTML spec) and
-routed through the HTML backend, with embedded images resolved from the
-archive by `Content-Location`/`cid:`. The discriminative PDF/image pipeline
+MHTML (docling's `InputFormat.MHTML`, docling#4184): saved-webpage
+`.mhtml`/`.mht` archives are parsed as a MIME message with
+[`mail-parser`](https://crates.io/crates/mail-parser) (which conforms to
+[RFC 2557](https://datatracker.ietf.org/doc/html/rfc2557), the MHTML spec), the
+`multipart/related` root part is selected the way docling selects it (`start`
+parameter, `multipart/alternative`) and routed through the HTML backend; with
+`--fetch-images` the archive's own image parts are embedded, resolved by
+`Content-Location`/`cid:` like docling resolves them. The discriminative PDF/image pipeline
 lives in `docling-pdf`: a pure-Rust PDF text parser, pdfium for page
 rasterization, and an ONNX layout/TableFormer/OCR stack. TableFormer is ported
 to ONNX and run on every detected table region to recover its structure;
@@ -207,6 +209,12 @@ an `X-Docling-Confidence` summary header (grades `poor`/`fair`/`good`/
 `excellent` + layout/OCR/parse scores) on every format, and the full per-page
 report under a top-level `confidence` key in `to=json` bodies.
 
+A conversion that *panics* — a backend bug reached on some input — answers
+**500** with the error body, on every endpoint, instead of leaving the caller
+with a silent empty 200 or a hanging request (#396). The panic still prints its
+message and backtrace to the server log, and the batch CLI reports that file as
+failed and moves on to the next one.
+
 `to=images` skips conversion entirely and rasterizes a PDF's pages to PNG
 through pdfium — `{"pages": [{"page", "width", "height", "png_base64"}]}` —
 honoring `pages=A-B` and a `scale` of 0.1–4.0 pixels per PDF point (default
@@ -216,6 +224,10 @@ honoring `pages=A-B` and a `scale` of 0.1–4.0 pixels per PDF point (default
 Options per request: `to=md|json|dclx|chunks|latex|images`, `strict`, `images=placeholder|embedded`,
 `skip_empty_cells`, `compact_tables`,
 `no_ocr`, `skip_ocr`, `no_table_former`, `no_text_panels`, `heading_hierarchy`, `force_full_page_ocr`, `pages`,
+`do_picture_classification`, `do_code_enrichment`, `do_formula_enrichment` (#423: the
+[enrichment models](#enrichment-models-picture-classification-code-formulas), named as
+docling's `PdfPipelineOptions` flags; a request that changes the enrichment mix rebuilds the
+warm pipeline once, the models themselves load lazily on the first matching region),
 `ocr_lang`, `ocr_mode`, `ocr_scale`, `scale`, `asr_model`, `asr_lang`, `video_frames`, `fetch_images`,
 `chunker=hierarchical|hybrid`, `chunk_tokenizer`, `chunk_max_tokens`, `chunk_merge_peers` (#256:
 per-request `to=chunks` configuration; the tokenizer is a server-local relative path),
@@ -338,6 +350,7 @@ fetch them on first use, the container images ship them baked in.
 # CLI
 docling-rs report.pdf --to md
 docling-rs --input ./docs --output ./out --to latex
+docling-rs --help        # every flag; --version reports the compiled-in features
 
 # HTTP
 curl -F file=@report.pdf 'localhost:5001/v1/convert?to=json&heading_hierarchy=true'
@@ -605,12 +618,13 @@ for (path, bytes) in files { std::fs::write(path, bytes).unwrap(); }
 `<!-- image -->`, like docling.
 
 > The cropped/extracted pixels are real, but the base64 won't be byte-identical
-> to docling's (different PNG encoder). HTML/EPUB pictures stay placeholders by
-> default (like docling); enable fetching with `--fetch-images` /
-> `DocumentConverter::fetch_images(true)` to resolve `<img src>` — `data:` URIs,
-> local files, remote `http(s)` URLs, and EPUB archive entries — and embed the
-> bytes. Remote URLs are fetched over the network, so enable it only for input
-> you trust.
+> to docling's (different PNG encoder). HTML/EPUB/MHTML/AsciiDoc/JATS pictures
+> stay placeholders by default (like docling); enable fetching with
+> `--fetch-images` / `DocumentConverter::fetch_images(true)` to resolve
+> `<img src>`, AsciiDoc's `image::target[]` and a JATS `<fig>`'s
+> `<graphic xlink:href>` — `data:` URIs, local files, remote `http(s)` URLs, and
+> EPUB/MHTML archive entries — and embed the bytes. Remote URLs are fetched over
+> the network, so enable it only for input you trust.
 
 ### `strict` Markdown (Rust-only)
 
@@ -850,6 +864,20 @@ identically. `--pages A-B` composes (only the window's pages are rendered
 and sent), and `--to md|json|dclx|chunks` plus `--strict` work as usual. Transient
 endpoint failures (timeouts, 408/429, 5xx) retry with exponential backoff;
 a page that still fails fails the conversion — no silently dropped pages.
+
+Answer grammars are auto-detected per response (#322): **DocTags**
+(granite-docling-class models) and **DocLang XML** as before, plus
+**Chandra** layout HTML (`<div data-bbox=… data-label=…>` blocks — tables
+with spans, Form-held tables, lists, figures, page furniture; docling
+2.123–2.125 semantics incl. `<br>`-as-spacing), **Unlimited-OCR** grounding
+output (normalized into the DeepSeek-OCR annotation shape and parsed by
+that backend), and raw **DeepSeek-OCR** annotated Markdown. Plain prose
+still degrades to text — hostile model output never errors. Known models
+also get their official prompts by name when `--vlm-prompt` isn't given:
+`unlimited*` → the model-card `<image>document parsing.` (any other phrasing
+returns an empty completion) plus the `skip_special_tokens=false` request
+flag its grounding markers need; `chandra*` → docling's Chandra layout
+prompt; everything else keeps the DocLang-eliciting default.
 Output quality is entirely the model's; what docling.rs adds is measured
 (#311): converting the PDF corpus through the same granite-docling endpoint
 from both docling.rs and Python docling's `VlmPipeline` scores **87.7% mean
@@ -1055,19 +1083,23 @@ instead — same models plus `pdfium.dll` — and see
 | RT-DETR layout | `.models/layout_heron.onnx` |
 | PP-OCRv3 rec + dictionary, English (the runtime default) | `.models/ocr_rec_en.onnx`, `.models/en_dict.txt` |
 | PP-OCRv3 rec + dictionary, multilingual `ch_` (`DOCLING_RS_OCR_LANG=ch`; the docling-conformance model — weak Latin word spacing) | `.models/ocr_rec.onnx`, `.models/ppocr_keys_v1.txt` |
-| TableFormer (optional) | `.models/tableformer/{encoder,decoder,bbox}.onnx` (+ `.data` sidecars where the export needs them) |
+| TableFormer (optional) | `.models/tableformer/{encoder,decoder,bbox}.onnx` (+ `.data` sidecars where the export needs them); `decoder_kv.onnx` is preferred when present — its current export has a dynamic batch axis, so all tables on a page decode in one lockstep loop (byte-identical to one at a time; an older fixed-batch `decoder_kv.onnx` still works, one table at a time) |
 | Whisper tiny (audio/ASR; skip with `--no-asr`) | `.models/asr/{encoder_model,decoder_model}.onnx`, `.models/asr/vocab.json` (+ `added_tokens.json` for language selection) |
 | Whisper presets (optional; `--asr-model=<preset>`, repeatable) | `.models/asr/<preset>/…` — English-only (`whisper_tiny_en`, `whisper_base_en`, `whisper_small_en`) and Distil-Whisper (`whisper_distil_small_en`) exports, fetched from Hugging Face |
 | INT8 CPU models (fetched by default; skip with `--no-int8`) | `.models/layout_heron_int8.onnx`, `.models/tableformer/decoder_int8.onnx` (+ `.models/code_formula/decoder_kv_int8.onnx` with `--enrich`) |
+| TableFormer encoder, fp16 weights (fetched by default; skip with `--no-int8`) | `.models/tableformer/encoder_fp16.onnx` — the same graph with fp16-stored weights cast back to fp32 at load (#374): half the download, fp32 compute; preferred when present, `DOCLING_RS_FP32=1` opts out |
 | DocumentFigureClassifier (picture classification) | `.models/picture_classifier.onnx` |
 | CodeFormulaV2 (code/formula enrichment, ~1.3 GB; fetch with `--enrich`) | `.models/code_formula/{vision,embed,decoder_kv}.onnx`, `.models/code_formula/tokenizer.json` |
 
 Idempotent — safe to re-run; it skips files already on disk. Pass `--force` to
 re-fetch everything, `--no-chunk` to skip the chunker tokenizer, `--embed` to
 also fetch the RAG embedder, or set `$DOCLING_RS_MODELS_URL` to fetch from a
-different host (your own export, an internal mirror, …); the Whisper assets
-come from Hugging Face (`$DOCLING_RS_ASR_MODELS_URL` overrides, or point
-`DOCLING_ASR_{ENCODER,DECODER,VOCAB}` at explicit files). pdfium is Linux x64
+different host (your own export, an internal mirror, …). Everything a default
+install needs is served from that one host; where the release tag predates a
+mirrored asset the script falls back to its upstream home (Hugging Face for
+the Whisper and OCR models, PaddleOCR for the dictionaries) —
+`$DOCLING_RS_ASR_MODELS_URL` overrides the Whisper host outright, or point
+`DOCLING_ASR_{ENCODER,DECODER,VOCAB}` at explicit files. pdfium is Linux x64
 only for now — other platforms, or building the models from source, need
 [`scripts/install/pdf_setup.sh`](#testing) instead.
 
@@ -1137,7 +1169,11 @@ let converter = DocumentConverter::new()
 
 Both models load lazily on the first matching region (a missing model warns
 once and skips that pass), and are shared pipeline-wide like TableFormer. The
-Python bindings take the same three `do_*` kwargs. Mind that CodeFormula is an
+same three switches exist on every surface: the Python kwargs and the
+docling-serve request options (`do_picture_classification`,
+`do_code_enrichment`, `do_formula_enrichment` — query, multipart or JSON body,
+#423) and the Node options (`doPictureClassification`, `doCodeEnrichment`,
+`doFormulaEnrichment`, also on `new Pipeline()`). Mind that CodeFormula is an
 autoregressive 256M-parameter VLM — expect seconds per code/formula region on
 CPU. Its decoder also ships as dynamic INT8 (`decoder_kv_int8.onnx`, ~165 MB
 vs ~655 MB fp32 — 4× less decoder RAM) — fetched with `--enrich` and preferred
@@ -1185,6 +1221,8 @@ cargo build --release -p docling-cli --features cuda      # NVIDIA CUDA (Linux/W
 #                                     --features tensorrt # NVIDIA TensorRT (usually with cuda)
 #                                     --features directml # DirectML (Windows)
 #                                     --features coreml   # CoreML (macOS)
+#                                     --features xnnpack  # XNNPACK (CPU-class ARM NEON / x86 SIMD;
+#                                                         # needs a self-built ONNX Runtime, see below)
 ```
 
 Each provider only exists on its OS (ort ships no CoreML build for Linux, no
@@ -1204,7 +1242,40 @@ DOCLING_RS_EP=cpu  docling-rs input.pdf   # force CPU (the default-build behavio
 An explicitly named provider that can't initialize (no device, missing
 driver/toolkit libs) fails the conversion rather than silently running 10×
 slower on CPU; `auto` is the quiet-fallback mode for images deployed on mixed
-fleets. When a GPU provider is selected, the pipeline automatically prefers
+fleets.
+
+CoreML registers with the **`MLProgram`** model format by default (#324):
+ONNX Runtime's own default, `NeuralNetwork`, cannot place operators the
+layout model carries (`GridSample`, `ScatterND`, dynamic output shapes) and
+aborts inference on Apple silicon instead of falling back.
+`DOCLING_RS_COREML_FORMAT=neuralnetwork` restores the old format on
+pre-macOS-12 systems. Two safety defaults come from the issue's follow-up
+testing on an M4 Max: CoreML takes only **static-shaped partitions** by
+default (`DOCLING_RS_COREML_STATIC_SHAPES=0` opts back into dynamic
+placement) — with the stock dynamic-batch layout model, dynamic partitions
+under MLProgram fail an MPSGraph assertion as an uncatchable SIGABRT — and
+compute units default to **`cpu_and_gpu`** (`DOCLING_RS_COREML_UNITS`:
+`all`|`cpu_and_gpu`|`cpu_and_ne`|`cpu_only`): `all` may schedule the fp16
+Neural Engine, which silently corrupts this model's logits (measured
+max|Δlogits| = 6.5 with no error raised) and ran slower than the GPU path.
+Known residual: the deformable-attention `GridSample` can still return wrong
+boxes on CoreML even with static shapes — the durable fix is on the model
+export side (#339).
+
+**When CoreML pays off** (measured on an M4 Max, #324 follow-up): session
+creation costs **~2 s per worker and does not parallelize**, so the fixed
+setup only amortizes over long-lived processes (`docling-serve`) and large
+batches — a one-shot CLI conversion is typically a net **loss** vs. the CPU
+provider (~2× on a 130-page document) despite byte-identical output, with the
+crossover around a few hundred pages per process. A `coreml`/`auto` build
+prints this once at registration so the trade-off is visible when it is
+incurred; `DOCLING_RS_EP=cpu` opts a short run out without rebuilding.
+The `xnnpack` feature adds the XNNPACK provider
+(`DOCLING_RS_EP=xnnpack`, thread pool sized by `DOCLING_RS_XNNPACK_THREADS`)
+— a CPU-class accelerator for machines without a usable GPU provider; note
+that pyke ships no prebuilt ONNX Runtime with the XNNPACK EP, so this
+feature requires linking a self-built ONNX Runtime (`ORT_LIB_LOCATION`,
+built with `--use_xnnpack`). When a GPU provider is selected, the pipeline automatically prefers
 the fp32 models over the int8 defaults — the int8 exports are calibrated for
 CPU kernels (an explicit `DOCLING_*_ONNX` path still wins). CUDA needs the
 CUDA 12 runtime + cuDNN 9 on the machine; the `ort` crate downloads the
@@ -1348,9 +1419,11 @@ All commands run from the repo workspace root.
 # everything — unit tests + the output-regression suite (pure Rust; no Python/models)
 cargo test
 
-# just the regression suite: re-convert every source under
-# crates/docling/tests/data/<fmt>/sources/ and assert that legacy Markdown,
-# strict Markdown and docling JSON match the committed fixtures (catches drift)
+# just the regression suite: re-convert every covered source — the upstream
+# fixtures each crates/docling/tests/data/<fmt>/mirror.txt lists from the root
+# tests/data/<fmt>/sources/ corpus, plus our own under
+# crates/docling/tests/data/<fmt>/sources/ — and assert that legacy Markdown,
+# strict Markdown, docling JSON and LaTeX match the committed fixtures
 cargo test -p docling --test regression
 
 # refresh the fixtures after an *intentional* output change, then review `git diff`
@@ -1407,9 +1480,12 @@ cargo run -p docling-cli -- recording.mp3
 # …with a named preset (fetch it first: download_dependencies.sh --asr-model=whisper_tiny_en)
 cargo run -p docling-cli -- --asr-model whisper_tiny_en recording.mp3
 
-# extract pictures (PDF/image inputs): embed as data URIs, or write ./artifacts/*.png
+# extract pictures: embed as data URIs, or write ./artifacts/*.png — for any
+# input that carries images, docling-JSON included (a `data:` URI or a
+# referenced file next to the JSON is read back, #403)
 cargo run -p docling-cli -- --images embedded   document.pdf
 cargo run -p docling-cli -- --images referenced document.pdf > out.md
+cargo run -p docling-cli -- --images referenced document.json > out.md
 
 # stream Markdown to stdout page by page (the CLI's default; --no-stream to buffer)
 cargo run -p docling-cli -- document.pdf
@@ -1511,6 +1587,9 @@ docker compose up -d                        # standalone service (127.0.0.1:5001
 | `DOCLING_RS_MAX_MEMORY_MB` | `0` (or cgroup) | Memory ceiling (MiB); returns 503 + Retry-After when near watermark |
 | `DOCLING_RS_MEMORY_WATERMARK_PCT` | `85` | Watermark % above which new requests get HTTP 503 |
 | `DOCLING_RS_TF_INTRA` | auto (#262) | Narrows ONNX intra-op thread count for TableFormer decoder sessions |
+| `DOCLING_RS_GRAPH_CACHE_DIR` | `$XDG_CACHE_HOME/docling-rs/graphs` (else `~/.cache/…`) | Where ONNX Runtime's optimized graphs are cached between processes (CPU provider only; session creation for the layout model ~0.8 s → ~0.15 s) |
+| `DOCLING_RS_NO_GRAPH_CACHE` | `0` | `1` disables the optimized-graph cache (models load and optimize from scratch every process) |
+| `DOCLING_RS_OCR_SESSIONS` | worker thread budget (1–8) | Parallel single-thread OCR recognition lanes per worker; output is byte-identical at any count |
 | `--concurrency N` | `2` | Max simultaneous conversions in flight; excess requests queue |
 | `--warmup` | enabled in image | Pre-load models at startup; `/ready` returns 503 until warm |
 | `/health` vs `/ready` | — | `/health` = liveness (200 immediately); `/ready` = readiness (200 once warm) |

@@ -14,7 +14,7 @@
 //! pages without one still fall back to OCR upstream.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use lopdf::{Dictionary, Document, Object};
 
@@ -30,8 +30,8 @@ use crate::pdfium_backend::Glyph;
 /// and stay uncached.
 #[derive(Default)]
 struct DocCaches {
-    fonts: HashMap<(lopdf::ObjectId, Vec<u8>), Rc<Font>>,
-    forms: HashMap<lopdf::ObjectId, Rc<lopdf::content::Content>>,
+    fonts: HashMap<(lopdf::ObjectId, Vec<u8>), Arc<Font>>,
+    forms: HashMap<lopdf::ObjectId, Arc<lopdf::content::Content>>,
 }
 
 /// A 2×3 affine matrix `[a b c d e f]`: maps `(x,y)` → `(a·x+c·y+e, b·x+d·y+f)`.
@@ -1014,30 +1014,66 @@ pub struct PageParserCells {
     pub code: Vec<crate::pdfium_backend::TextCell>,
 }
 
+/// The parser text layer, driven one page at a time: the document is loaded
+/// (and repaired, see [`load_document`]) once, the font/form caches persist
+/// across pages, and each page's glyphs are parsed only when asked for.
+///
+/// The eager whole-document walk this replaces ran *before* the first page
+/// was rendered, so on a long PDF it was a serial prefix the page-worker pool
+/// sat idle through — 6.2 s on the 1913-page .NET reference, in front of a
+/// pipeline that otherwise overlaps parsing with inference — and a `--pages`
+/// window still paid for every page in the file. Pulling pages on demand
+/// keeps the parse on the producer thread but interleaved with rendering,
+/// and skips unselected pages entirely. Output per page is unchanged: same
+/// glyph walk, same shared caches, same contraction.
+pub struct PageTextParser {
+    doc: Document,
+    caches: DocCaches,
+    /// Page object ids in document order (page 1 first).
+    pages: Vec<lopdf::ObjectId>,
+}
+
+impl PageTextParser {
+    /// Load the document; `None` when it has no parseable text layer at all
+    /// (the caller then keeps pdfium's cells, as before).
+    pub fn open(bytes: &[u8]) -> Option<Self> {
+        let doc = load_document(bytes)?;
+        let mut pages: Vec<_> = doc.get_pages().into_iter().collect();
+        pages.sort_by_key(|(n, _)| *n);
+        Some(Self {
+            doc,
+            caches: DocCaches::default(),
+            pages: pages.into_iter().map(|(_, pid)| pid).collect(),
+        })
+    }
+
+    /// Prose, word and code cells of the 0-based page `index` — empty for an
+    /// index the parser's page tree doesn't have (pdfium and lopdf can
+    /// disagree on a damaged file; the caller falls back to pdfium's text).
+    pub fn cells(&mut self, index: usize) -> PageParserCells {
+        let Some(&pid) = self.pages.get(index) else {
+            return PageParserCells::default();
+        };
+        let (_w, h) = page_size(&self.doc, pid);
+        let glyphs = page_glyphs_cached(&self.doc, pid, &mut self.caches);
+        let (prose, words) = crate::dp_lines::line_and_word_cells(&glyphs, h, true);
+        PageParserCells {
+            prose,
+            words,
+            code: crate::pdfium_backend::code_cells_from_glyphs(&glyphs, h),
+        }
+    }
+}
+
 /// Full parser text layer: prose + word + code cells per page, glyphs parsed once.
 /// `prose`/`words` come from the docling-parse contraction ([`crate::dp_lines`]);
 /// `code` splits only at the parser's own space glyphs (monospace keeps its
-/// source spacing). Used by the pipeline to retire pdfium's text path.
+/// source spacing). The eager form of [`PageTextParser`].
 pub fn pdf_all_cells(bytes: &[u8]) -> Vec<PageParserCells> {
-    let Some(doc) = load_document(bytes) else {
+    let Some(mut parser) = PageTextParser::open(bytes) else {
         return Vec::new();
     };
-    let mut caches = DocCaches::default();
-    let mut pages: Vec<_> = doc.get_pages().into_iter().collect();
-    pages.sort_by_key(|(n, _)| *n);
-    pages
-        .into_iter()
-        .map(|(_, pid)| {
-            let (_w, h) = page_size(&doc, pid);
-            let glyphs = page_glyphs_cached(&doc, pid, &mut caches);
-            let (prose, words) = crate::dp_lines::line_and_word_cells(&glyphs, h, true);
-            PageParserCells {
-                prose,
-                words,
-                code: crate::pdfium_backend::code_cells_from_glyphs(&glyphs, h),
-            }
-        })
-        .collect()
+    (0..parser.pages.len()).map(|i| parser.cells(i)).collect()
 }
 
 /// Whole pages for the text-layer-only conversion ([`crate::convert_text_layer`]):
@@ -1164,7 +1200,7 @@ fn fonts_from_res(
     doc: &Document,
     res: &Dictionary,
     caches: &mut DocCaches,
-) -> HashMap<Vec<u8>, Rc<Font>> {
+) -> HashMap<Vec<u8>, Arc<Font>> {
     let mut map = HashMap::new();
     let font_dict = res
         .get(b"Font")
@@ -1177,10 +1213,10 @@ fn fonts_from_res(
                 Object::Reference(id) => {
                     let key = (*id, name.clone());
                     if let Some(f) = caches.fonts.get(&key) {
-                        Rc::clone(f)
+                        Arc::clone(f)
                     } else if let Some(fdict) = deref(doc, value).and_then(|o| o.as_dict().ok()) {
-                        let f = Rc::new(parse_font(doc, name, fdict));
-                        caches.fonts.insert(key, Rc::clone(&f));
+                        let f = Arc::new(parse_font(doc, name, fdict));
+                        caches.fonts.insert(key, Arc::clone(&f));
                         f
                     } else {
                         continue;
@@ -1188,7 +1224,7 @@ fn fonts_from_res(
                 }
                 _ => {
                     if let Some(fdict) = deref(doc, value).and_then(|o| o.as_dict().ok()) {
-                        Rc::new(parse_font(doc, name, fdict))
+                        Arc::new(parse_font(doc, name, fdict))
                     } else {
                         continue;
                     }
@@ -1261,11 +1297,11 @@ fn run_content(
     // *not* the text matrix (that is reset by BT). Saving only the CTM let a Tc
     // set inside a `q…Q` block leak out and drift every later glyph.
     #[allow(clippy::type_complexity)]
-    let mut gstate_stack: Vec<(Mat, f64, f64, f64, f64, f64, f64, Option<&Rc<Font>>)> = Vec::new();
+    let mut gstate_stack: Vec<(Mat, f64, f64, f64, f64, f64, f64, Option<&Arc<Font>>)> = Vec::new();
     let mut ctm = base_ctm;
     let mut tm = Mat::ID;
     let mut tlm = Mat::ID;
-    let mut font: Option<&Rc<Font>> = None;
+    let mut font: Option<&Arc<Font>> = None;
     let mut fsize = init.fsize;
     let mut tc = init.tc; // char spacing
     let mut tw = init.tw; // word spacing
@@ -1455,9 +1491,9 @@ fn run_content(
                         let Ok(c) = lopdf::content::Content::decode(&data) else {
                             continue;
                         };
-                        let c = Rc::new(c);
+                        let c = Arc::new(c);
                         if let Some(id) = form_id {
-                            caches.forms.insert(id, Rc::clone(&c));
+                            caches.forms.insert(id, Arc::clone(&c));
                         }
                         c
                     }

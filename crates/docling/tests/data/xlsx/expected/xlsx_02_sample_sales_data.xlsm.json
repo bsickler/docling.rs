@@ -18,26 +18,56 @@
     "self_ref": "#/body",
     "children": [
       {
-        "$ref": "#/tables/0"
+        "$ref": "#/groups/0"
       }
     ],
     "content_layer": "body",
     "name": "_root_",
     "label": "unspecified"
   },
-  "groups": [],
+  "groups": [
+    {
+      "self_ref": "#/groups/0",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "children": [
+        {
+          "$ref": "#/tables/0"
+        }
+      ],
+      "content_layer": "body",
+      "name": "SalesData",
+      "label": "sheet"
+    }
+  ],
   "texts": [],
   "pictures": [],
   "tables": [
     {
       "self_ref": "#/tables/0",
       "parent": {
-        "$ref": "#/body"
+        "$ref": "#/groups/0"
       },
       "children": [],
       "content_layer": "body",
       "label": "table",
-      "prov": [],
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": {
+            "l": 0.0,
+            "t": 0.0,
+            "r": 4.0,
+            "b": 21.0,
+            "coord_origin": "TOPLEFT"
+          },
+          "charspan": [
+            0,
+            0
+          ]
+        }
+      ],
       "captions": [],
       "references": [],
       "footnotes": [],
@@ -1138,6 +1168,7 @@
         ],
         "num_rows": 21,
         "num_cols": 4,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -2280,5 +2311,13 @@
   ],
   "key_value_items": [],
   "form_items": [],
-  "pages": {}
+  "pages": {
+    "1": {
+      "size": {
+        "width": 4.0,
+        "height": 21.0
+      },
+      "page_no": 1
+    }
+  }
 }

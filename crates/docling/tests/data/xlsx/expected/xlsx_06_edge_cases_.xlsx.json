@@ -18,35 +18,93 @@
     "self_ref": "#/body",
     "children": [
       {
-        "$ref": "#/tables/0"
+        "$ref": "#/groups/0"
       },
       {
-        "$ref": "#/tables/1"
+        "$ref": "#/groups/1"
       },
       {
-        "$ref": "#/tables/2"
-      },
-      {
-        "$ref": "#/tables/3"
+        "$ref": "#/groups/2"
       }
     ],
     "content_layer": "body",
     "name": "_root_",
     "label": "unspecified"
   },
-  "groups": [],
+  "groups": [
+    {
+      "self_ref": "#/groups/0",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "children": [
+        {
+          "$ref": "#/tables/0"
+        }
+      ],
+      "content_layer": "body",
+      "name": "missing_header_head",
+      "label": "sheet"
+    },
+    {
+      "self_ref": "#/groups/1",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "children": [
+        {
+          "$ref": "#/tables/1"
+        }
+      ],
+      "content_layer": "body",
+      "name": "Attached_left",
+      "label": "sheet"
+    },
+    {
+      "self_ref": "#/groups/2",
+      "parent": {
+        "$ref": "#/body"
+      },
+      "children": [
+        {
+          "$ref": "#/tables/2"
+        },
+        {
+          "$ref": "#/tables/3"
+        }
+      ],
+      "content_layer": "body",
+      "name": "Diagonal",
+      "label": "sheet"
+    }
+  ],
   "texts": [],
   "pictures": [],
   "tables": [
     {
       "self_ref": "#/tables/0",
       "parent": {
-        "$ref": "#/body"
+        "$ref": "#/groups/0"
       },
       "children": [],
       "content_layer": "body",
       "label": "table",
-      "prov": [],
+      "prov": [
+        {
+          "page_no": 1,
+          "bbox": {
+            "l": 0.0,
+            "t": 0.0,
+            "r": 6.0,
+            "b": 4.0,
+            "coord_origin": "TOPLEFT"
+          },
+          "charspan": [
+            0,
+            0
+          ]
+        }
+      ],
       "captions": [],
       "references": [],
       "footnotes": [],
@@ -367,6 +425,7 @@
         ],
         "num_rows": 4,
         "num_cols": 6,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -695,12 +754,27 @@
     {
       "self_ref": "#/tables/1",
       "parent": {
-        "$ref": "#/body"
+        "$ref": "#/groups/1"
       },
       "children": [],
       "content_layer": "body",
       "label": "table",
-      "prov": [],
+      "prov": [
+        {
+          "page_no": 2,
+          "bbox": {
+            "l": 0.0,
+            "t": 1.0,
+            "r": 7.0,
+            "b": 5.0,
+            "coord_origin": "TOPLEFT"
+          },
+          "charspan": [
+            0,
+            0
+          ]
+        }
+      ],
       "captions": [],
       "references": [],
       "footnotes": [],
@@ -1073,6 +1147,7 @@
         ],
         "num_rows": 4,
         "num_cols": 7,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -1453,12 +1528,27 @@
     {
       "self_ref": "#/tables/2",
       "parent": {
-        "$ref": "#/body"
+        "$ref": "#/groups/2"
       },
       "children": [],
       "content_layer": "body",
       "label": "table",
-      "prov": [],
+      "prov": [
+        {
+          "page_no": 3,
+          "bbox": {
+            "l": 0.0,
+            "t": 0.0,
+            "r": 6.0,
+            "b": 4.0,
+            "coord_origin": "TOPLEFT"
+          },
+          "charspan": [
+            0,
+            0
+          ]
+        }
+      ],
       "captions": [],
       "references": [],
       "footnotes": [],
@@ -1779,6 +1869,7 @@
         ],
         "num_rows": 4,
         "num_cols": 6,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -2107,12 +2198,27 @@
     {
       "self_ref": "#/tables/3",
       "parent": {
-        "$ref": "#/body"
+        "$ref": "#/groups/2"
       },
       "children": [],
       "content_layer": "body",
       "label": "table",
-      "prov": [],
+      "prov": [
+        {
+          "page_no": 3,
+          "bbox": {
+            "l": 6.0,
+            "t": 4.0,
+            "r": 9.0,
+            "b": 7.0,
+            "coord_origin": "TOPLEFT"
+          },
+          "charspan": [
+            0,
+            0
+          ]
+        }
+      ],
       "captions": [],
       "references": [],
       "footnotes": [],
@@ -2238,6 +2344,7 @@
         ],
         "num_rows": 3,
         "num_cols": 3,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -2369,5 +2476,27 @@
   ],
   "key_value_items": [],
   "form_items": [],
-  "pages": {}
+  "pages": {
+    "1": {
+      "size": {
+        "width": 6.0,
+        "height": 4.0
+      },
+      "page_no": 1
+    },
+    "2": {
+      "size": {
+        "width": 7.0,
+        "height": 5.0
+      },
+      "page_no": 2
+    },
+    "3": {
+      "size": {
+        "width": 9.0,
+        "height": 7.0
+      },
+      "page_no": 3
+    }
+  }
 }

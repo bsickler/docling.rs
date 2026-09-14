@@ -63,6 +63,9 @@
         "$ref": "#/texts/14"
       },
       {
+        "$ref": "#/texts/15"
+      },
+      {
         "$ref": "#/pictures/0"
       },
       {
@@ -73,6 +76,9 @@
       },
       {
         "$ref": "#/texts/18"
+      },
+      {
+        "$ref": "#/texts/19"
       },
       {
         "$ref": "#/tables/0"
@@ -102,6 +108,9 @@
         "$ref": "#/texts/27"
       },
       {
+        "$ref": "#/texts/28"
+      },
+      {
         "$ref": "#/tables/1"
       },
       {
@@ -111,10 +120,16 @@
         "$ref": "#/texts/30"
       },
       {
+        "$ref": "#/texts/31"
+      },
+      {
         "$ref": "#/tables/2"
       },
       {
         "$ref": "#/texts/32"
+      },
+      {
+        "$ref": "#/texts/33"
       },
       {
         "$ref": "#/tables/3"
@@ -142,6 +157,9 @@
       },
       {
         "$ref": "#/texts/41"
+      },
+      {
+        "$ref": "#/texts/42"
       },
       {
         "$ref": "#/tables/4"
@@ -180,6 +198,9 @@
         "$ref": "#/texts/53"
       },
       {
+        "$ref": "#/texts/54"
+      },
+      {
         "$ref": "#/pictures/1"
       },
       {
@@ -198,6 +219,9 @@
         "$ref": "#/texts/59"
       },
       {
+        "$ref": "#/texts/60"
+      },
+      {
         "$ref": "#/pictures/2"
       },
       {
@@ -208,6 +232,9 @@
       },
       {
         "$ref": "#/texts/63"
+      },
+      {
+        "$ref": "#/texts/64"
       },
       {
         "$ref": "#/pictures/3"
@@ -663,8 +690,8 @@
       "content_layer": "body",
       "label": "text",
       "prov": [],
-      "orig": "An LCA was developed according to the ISO standards [23,24] and Food and Agriculture Organization of the United Nations (FAO) Livestock Environmental Assessment Protocol guidelines [25]. All procedures were approved by the ‘Comissão de Ética no Uso de Animais’ (CEUA/UDESC) on September 15, 2016—Approval number 4373090816 - https://www.udesc.br/cav/ceua.",
-      "text": "An LCA was developed according to the ISO standards [23,24] and Food and Agriculture Organization of the United Nations (FAO) Livestock Environmental Assessment Protocol guidelines [25]. All procedures were approved by the ‘Comissão de Ética no Uso de Animais’ (CEUA/UDESC) on September 15, 2016—Approval number 4373090816 - https://www.udesc.br/cav/ceua."
+      "orig": "An LCA was developed according to the ISO standards [23,24] and Food and Agriculture Organization of the United Nations (FAO) Livestock Environmental Assessment Protocol guidelines [25]. All procedures were approved by the ‘Comissão de Ética no Uso de Animais’ (CEUA/UDESC) on September 15, 2016—Approval number 4373090816 - [https://www.udesc.br/cav/ceua](https://www.udesc.br/cav/ceua) .",
+      "text": "An LCA was developed according to the ISO standards [23,24] and Food and Agriculture Organization of the United Nations (FAO) Livestock Environmental Assessment Protocol guidelines [25]. All procedures were approved by the ‘Comissão de Ética no Uso de Animais’ (CEUA/UDESC) on September 15, 2016—Approval number 4373090816 - [https://www.udesc.br/cav/ceua](https://www.udesc.br/cav/ceua) ."
     },
     {
       "self_ref": "#/texts/13",
@@ -694,7 +721,7 @@
     {
       "self_ref": "#/texts/15",
       "parent": {
-        "$ref": "#/pictures/0"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -743,7 +770,7 @@
     {
       "self_ref": "#/texts/19",
       "parent": {
-        "$ref": "#/tables/0"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -849,13 +876,13 @@
       "content_layer": "body",
       "label": "text",
       "prov": [],
-      "orig": "The DM intake of each ingredient throughout the entire life of animals during lactation periods was calculated for each scenario: cows receiving only TMR, cows receiving 75% of TMR with annual pastures and cows receiving 50% of TMR with annual pastures (Table 2). In each of other phases of life (calf, heifer, dry cow), animals received the same diet, including a perennial tropical pasture (kikuyu grass, *Pennisetum clandestinum* ). The DM intake of calves, heifers and dry cows was calculated assuming 2.8, 2.5 and 1.9% body weight, respectively [20]. In each case, the actual DM intake of concentrate and corn silage was recorded, and pasture DM intake was estimated by the difference between daily expected DM intake and actual DM intake of concentrate and corn silage. For lactating heifers and cows, TMR was formulated to meet the net energy for lactation (NE L ) and metabolizable protein (MP) requirements of experimental animals, according to [28]. The INRA system was used because it is possible to estimate pasture DM intake taking into account the TMR intake, pasture management and the time of access to pasture using the GrazeIn model [29], which was integrated in the software INRAtion 4.07 (https://www.inration.educagri.fr/fr/forum.php). The nutrient intake was calculated as a product of TMR and pasture intake and the nutrient contents of TMR and pasture, respectively, which were determined in feed samples collected throughout the experiments.",
-      "text": "The DM intake of each ingredient throughout the entire life of animals during lactation periods was calculated for each scenario: cows receiving only TMR, cows receiving 75% of TMR with annual pastures and cows receiving 50% of TMR with annual pastures (Table 2). In each of other phases of life (calf, heifer, dry cow), animals received the same diet, including a perennial tropical pasture (kikuyu grass, *Pennisetum clandestinum* ). The DM intake of calves, heifers and dry cows was calculated assuming 2.8, 2.5 and 1.9% body weight, respectively [20]. In each case, the actual DM intake of concentrate and corn silage was recorded, and pasture DM intake was estimated by the difference between daily expected DM intake and actual DM intake of concentrate and corn silage. For lactating heifers and cows, TMR was formulated to meet the net energy for lactation (NE L ) and metabolizable protein (MP) requirements of experimental animals, according to [28]. The INRA system was used because it is possible to estimate pasture DM intake taking into account the TMR intake, pasture management and the time of access to pasture using the GrazeIn model [29], which was integrated in the software INRAtion 4.07 (https://www.inration.educagri.fr/fr/forum.php). The nutrient intake was calculated as a product of TMR and pasture intake and the nutrient contents of TMR and pasture, respectively, which were determined in feed samples collected throughout the experiments."
+      "orig": "The DM intake of each ingredient throughout the entire life of animals during lactation periods was calculated for each scenario: cows receiving only TMR, cows receiving 75% of TMR with annual pastures and cows receiving 50% of TMR with annual pastures (Table 2). In each of other phases of life (calf, heifer, dry cow), animals received the same diet, including a perennial tropical pasture (kikuyu grass, *Pennisetum clandestinum* ). The DM intake of calves, heifers and dry cows was calculated assuming 2.8, 2.5 and 1.9% body weight, respectively [20]. In each case, the actual DM intake of concentrate and corn silage was recorded, and pasture DM intake was estimated by the difference between daily expected DM intake and actual DM intake of concentrate and corn silage. For lactating heifers and cows, TMR was formulated to meet the net energy for lactation (NE L ) and metabolizable protein (MP) requirements of experimental animals, according to [28]. The INRA system was used because it is possible to estimate pasture DM intake taking into account the TMR intake, pasture management and the time of access to pasture using the GrazeIn model [29], which was integrated in the software INRAtion 4.07 ( [https://www.inration.educagri.fr/fr/forum.php](https://www.inration.educagri.fr/fr/forum.php) ). The nutrient intake was calculated as a product of TMR and pasture intake and the nutrient contents of TMR and pasture, respectively, which were determined in feed samples collected throughout the experiments.",
+      "text": "The DM intake of each ingredient throughout the entire life of animals during lactation periods was calculated for each scenario: cows receiving only TMR, cows receiving 75% of TMR with annual pastures and cows receiving 50% of TMR with annual pastures (Table 2). In each of other phases of life (calf, heifer, dry cow), animals received the same diet, including a perennial tropical pasture (kikuyu grass, *Pennisetum clandestinum* ). The DM intake of calves, heifers and dry cows was calculated assuming 2.8, 2.5 and 1.9% body weight, respectively [20]. In each case, the actual DM intake of concentrate and corn silage was recorded, and pasture DM intake was estimated by the difference between daily expected DM intake and actual DM intake of concentrate and corn silage. For lactating heifers and cows, TMR was formulated to meet the net energy for lactation (NE L ) and metabolizable protein (MP) requirements of experimental animals, according to [28]. The INRA system was used because it is possible to estimate pasture DM intake taking into account the TMR intake, pasture management and the time of access to pasture using the GrazeIn model [29], which was integrated in the software INRAtion 4.07 ( [https://www.inration.educagri.fr/fr/forum.php](https://www.inration.educagri.fr/fr/forum.php) ). The nutrient intake was calculated as a product of TMR and pasture intake and the nutrient contents of TMR and pasture, respectively, which were determined in feed samples collected throughout the experiments."
     },
     {
       "self_ref": "#/texts/28",
       "parent": {
-        "$ref": "#/tables/1"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -892,7 +919,7 @@
     {
       "self_ref": "#/texts/31",
       "parent": {
-        "$ref": "#/tables/2"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -916,7 +943,7 @@
     {
       "self_ref": "#/texts/33",
       "parent": {
-        "$ref": "#/tables/3"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -1027,7 +1054,7 @@
     {
       "self_ref": "#/texts/42",
       "parent": {
-        "$ref": "#/tables/4"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -1175,7 +1202,7 @@
     {
       "self_ref": "#/texts/54",
       "parent": {
-        "$ref": "#/pictures/1"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -1248,7 +1275,7 @@
     {
       "self_ref": "#/texts/60",
       "parent": {
-        "$ref": "#/pictures/2"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -1297,7 +1324,7 @@
     {
       "self_ref": "#/texts/64",
       "parent": {
-        "$ref": "#/pictures/3"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -3160,6 +3187,7 @@
         ],
         "num_rows": 13,
         "num_cols": 3,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -6254,6 +6282,7 @@
         ],
         "num_rows": 21,
         "num_cols": 11,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -9910,6 +9939,7 @@
         ],
         "num_rows": 9,
         "num_cols": 5,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -12359,6 +12389,7 @@
         ],
         "num_rows": 28,
         "num_cols": 5,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -14885,6 +14916,7 @@
         ],
         "num_rows": 12,
         "num_cols": 4,
+        "orientation": "rot_0",
         "grid": [
           [
             {

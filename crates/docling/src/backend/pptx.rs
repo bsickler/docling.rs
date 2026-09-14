@@ -2,11 +2,16 @@
 //!
 //! Ports docling's `MsPowerpointDocumentBackend`: each slide's shape tree is
 //! walked in order, emitting titles, paragraphs, bullet/numbered lists, tables,
-//! and pictures. Bullet detection follows the practical rule docling's
-//! `_get_effective_list_marker` resolves to: an explicit `buNone`/`buChar`/
-//! `buAutoNum` wins; otherwise body placeholders inherit a bullet from the
-//! master (so they default to a list) while plain text boxes default to a
-//! paragraph.
+//! and pictures. Bullet detection follows docling's `_get_effective_list_marker`:
+//! the paragraph's own `a:pPr` marker wins (`buNone`/`buChar`/`buAutoNum`/
+//! `buBlip`), then the owning shape's `a:lstStyle` level properties for the
+//! paragraph's level supply an inherited one (#406); with no marker anywhere,
+//! body placeholders inherit a bullet from the master (so they default to a
+//! list), an indented paragraph is a list item (docling's `level > 0`
+//! fallback), and a plain text box paragraph stays a paragraph. The layout
+//! placeholder's list style and the master's `p:txStyles` — the tail of
+//! docling's chain — are not walked yet; the body-placeholder default stands in
+//! for them.
 
 use std::collections::{HashMap, HashSet};
 
@@ -57,7 +62,24 @@ impl DeclarativeBackend for PptxBackend {
             let Some((content, comments)) = frag else {
                 continue;
             };
-            doc.nodes.extend(content);
+            // docling records every slide as a page sized in EMU, which is
+            // what its item provenance is expressed in (#402).
+            doc.push(Node::PageInfo {
+                page_no: slide_ix + 1,
+                width: slide_size.0 as f32,
+                height: slide_size.1 as f32,
+            });
+            // docling gives each slide a `chapter` group named `slide-{0-based}`
+            // and hangs everything the slide holds off it (#402), so a note or
+            // a caption belongs to its slide rather than to the document body.
+            // Groups are transparent to Markdown and DocLang, so only the JSON
+            // gains the structure.
+            doc.push(Node::Group {
+                label: "chapter".into(),
+                name: Some(format!("slide-{slide_ix}")),
+                layer: None,
+                children: content,
+            });
             // DocLang page break: docling's serializer places each slide
             // boundary's break *after* the following slide's content (every
             // slide beyond the first trails one — same artifact as XLSX
@@ -426,6 +448,7 @@ fn handle_shape(
                         caption_href: None,
                         image: images.get(&rid).cloned(),
                         classification: None,
+                        caption_parent: Default::default(),
                     },
                 );
             }
@@ -618,8 +641,12 @@ fn handle_text_shape(sp: XmlNode, location: [u16; 4], doc: &mut DoclingDocument)
     let mut number = 0u64;
     for para in paragraphs {
         let text = paragraph_text(para);
-        match list_kind(para, kind) {
+        match list_kind(para, Some(tx_body), kind) {
             Some(numbered) => {
+                // docling opens one ListGroup per run of list paragraphs in a
+                // shape (`new_list`, reset by a non-list paragraph): the first
+                // item of the run starts the list, whatever marker kinds follow.
+                let first_in_list = !in_list;
                 if !in_list {
                     in_list = true;
                     number = 0;
@@ -637,7 +664,7 @@ fn handle_text_shape(sp: XmlNode, location: [u16; 4], doc: &mut DoclingDocument)
                 doc.push(Node::ListItem {
                     ordered: numbered,
                     number: n,
-                    first_in_list: false,
+                    first_in_list,
                     text,
                     level: 0,
                     marker: numbered.then(|| format!("{n}.")),
@@ -653,8 +680,11 @@ fn handle_text_shape(sp: XmlNode, location: [u16; 4], doc: &mut DoclingDocument)
                     Placeholder::Title => {
                         push_located(doc, location, Node::Heading { level: 1, text })
                     }
-                    // docling intends SECTION_HEADER for subtitles but a bug
-                    // leaves the label as PARAGRAPH, so subtitles render as text.
+                    // A subtitle placeholder is a paragraph on purpose: docling
+                    // settled it in docling#3785 and, after briefly moving it
+                    // to SECTION_HEADER behind an option, reverted to that in
+                    // docling#4190 (which also deleted the dead `_handle_title`
+                    // that would have labelled it). Not a bug to fix.
                     _ => push_located(doc, location, Node::Paragraph { text }),
                 }
             }
@@ -662,24 +692,68 @@ fn handle_text_shape(sp: XmlNode, location: [u16; 4], doc: &mut DoclingDocument)
     }
 }
 
+/// The marker a properties element (`a:pPr` or `a:lvl{N}pPr`) declares, if it
+/// declares one at all — docling's `_parse_bullet_from_paragraph_properties`.
+/// `Some(None)` is an explicit `buNone`: "this is deliberately not a list".
+fn declared_marker(p_pr: XmlNode) -> Option<Option<bool>> {
+    if p_pr.children().any(|n| n.has_tag_name("buNone")) {
+        return Some(None);
+    }
+    if p_pr.children().any(|n| n.has_tag_name("buAutoNum")) {
+        return Some(Some(true));
+    }
+    if p_pr
+        .children()
+        .any(|n| n.has_tag_name("buChar") || n.has_tag_name("buBlip"))
+    {
+        return Some(Some(false));
+    }
+    None
+}
+
+/// A paragraph's outline level (`a:pPr/@lvl`, 0 when absent), which selects the
+/// `a:lvl{lvl+1}pPr` that supplies an inherited marker.
+fn paragraph_level(para: XmlNode) -> usize {
+    para.children()
+        .find(|n| n.has_tag_name("pPr"))
+        .and_then(|pr| pr.attribute("lvl"))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Whether a paragraph is a list item: `Some(true)` numbered, `Some(false)`
 /// bulleted, `None` not a list.
-fn list_kind(para: XmlNode, placeholder: Placeholder) -> Option<bool> {
+///
+/// docling's `_get_effective_list_marker` order: the paragraph's own `a:pPr`
+/// first, then — and this is what a styled deck relies on — the *owning shape's*
+/// list style, `a:txBody/a:lstStyle/a:lvl{lvl+1}pPr` selected by the paragraph's
+/// level (#406). The level only picks which level properties supply the marker;
+/// the items are not nested.
+fn list_kind(para: XmlNode, tx_body: Option<XmlNode>, placeholder: Placeholder) -> Option<bool> {
+    let lvl = paragraph_level(para);
     if let Some(p_pr) = para.children().find(|n| n.has_tag_name("pPr")) {
-        if p_pr.children().any(|n| n.has_tag_name("buNone")) {
-            return None;
-        }
-        if p_pr.children().any(|n| n.has_tag_name("buAutoNum")) {
-            return Some(true);
-        }
-        if p_pr.children().any(|n| n.has_tag_name("buChar")) {
-            return Some(false);
+        if let Some(kind) = declared_marker(p_pr) {
+            return kind;
         }
     }
-    // No explicit marker: body placeholders inherit a bullet from the master.
+    if let Some(lvl_pr) = tx_body
+        .and_then(|b| b.children().find(|n| n.has_tag_name("lstStyle")))
+        .and_then(|st| {
+            st.children()
+                .find(|n| n.has_tag_name(format!("lvl{}pPr", lvl + 1).as_str()))
+        })
+    {
+        if let Some(kind) = declared_marker(lvl_pr) {
+            return kind;
+        }
+    }
+    // No marker anywhere in the shape: body placeholders inherit a bullet from
+    // the master (the layout/master `lstStyle` chain in docling), and any
+    // indented paragraph is a list item even without one — docling's
+    // `paragraph.level > 0` fallback.
     match placeholder {
         Placeholder::Body => Some(false),
-        _ => None,
+        _ => (lvl > 0).then_some(false),
     }
 }
 
@@ -766,6 +840,7 @@ fn parse_table(tbl: XmlNode) -> Option<Table> {
         cell_blocks: None,
         cells: None,
         caption: None,
+        caption_parent: Default::default(),
     })
 }
 
@@ -801,7 +876,7 @@ mod chart_tests {
     #[test]
     fn native_chart_yields_classified_data_grid() {
         let path = format!(
-            "{}/tests/data/pptx/sources/pptx_chart.pptx",
+            "{}/../../tests/data/pptx/sources/pptx_chart.pptx",
             env!("CARGO_MANIFEST_DIR")
         );
         let bytes = std::fs::read(&path).expect("fixture exists");
@@ -810,6 +885,11 @@ mod chart_tests {
         let chart = doc
             .nodes
             .iter()
+            // Slide content hangs off the slide's own group (#402).
+            .flat_map(|n| match n {
+                Node::Group { children, .. } => children.as_slice(),
+                other => std::slice::from_ref(other),
+            })
             .find_map(|n| match n {
                 Node::Chart {
                     kind,
@@ -828,5 +908,70 @@ mod chart_tests {
         );
         assert_eq!(chart.1.rows[0][1], "Freshwater Ducks");
         assert_eq!(chart.1.rows[1], vec!["2019", "120", "80"]);
+    }
+}
+
+#[cfg(test)]
+mod list_marker_tests {
+    use super::{list_kind, Placeholder};
+
+    /// #406: a paragraph with no bullet properties of its own takes its marker
+    /// from the owning shape's `a:lstStyle`, selected by the paragraph's level —
+    /// docling's `_get_effective_list_marker` step 2. The level only picks the
+    /// `a:lvl{N}pPr`; it does not nest the item.
+    #[test]
+    fn a_shape_list_style_supplies_the_inherited_marker() {
+        let xml = r#"<p:sp xmlns:p="p" xmlns:a="a"><p:txBody>
+            <a:lstStyle>
+              <a:lvl1pPr><a:buChar char="■"/></a:lvl1pPr>
+              <a:lvl2pPr><a:buChar char="–"/></a:lvl2pPr>
+              <a:lvl3pPr><a:buAutoNum type="arabicPeriod"/></a:lvl3pPr>
+              <a:lvl4pPr><a:buNone/></a:lvl4pPr>
+            </a:lstStyle>
+            <a:p><a:r><a:t>level 1 bullet</a:t></a:r></a:p>
+            <a:p><a:pPr lvl="1"/><a:r><a:t>level 2 bullet</a:t></a:r></a:p>
+            <a:p><a:pPr lvl="2"/><a:r><a:t>level 3 numbered</a:t></a:r></a:p>
+            <a:p><a:pPr lvl="3"/><a:r><a:t>level 4: style says no bullet</a:t></a:r></a:p>
+            <a:p><a:pPr lvl="5"/><a:r><a:t>level 6: no style at all</a:t></a:r></a:p>
+            <a:p><a:pPr lvl="2"><a:buNone/></a:pPr><a:r><a:t>own buNone wins</a:t></a:r></a:p>
+        </p:txBody></p:sp>"#;
+        let dom = roxmltree::Document::parse(xml).unwrap();
+        let body = dom
+            .descendants()
+            .find(|n| n.has_tag_name("txBody"))
+            .unwrap();
+        let kinds: Vec<Option<bool>> = body
+            .children()
+            .filter(|n| n.has_tag_name("p"))
+            .map(|p| list_kind(p, Some(body), Placeholder::TextBox))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                Some(false), // lvl1pPr buChar
+                Some(false), // lvl2pPr buChar
+                Some(true),  // lvl3pPr buAutoNum
+                None,        // lvl4pPr buNone: deliberately not a list
+                Some(false), // no marker anywhere, but indented: docling's level > 0 fallback
+                None,        // the paragraph's own buNone beats the style's buAutoNum
+            ]
+        );
+    }
+
+    /// Without a shape list style the old rule stands: a body placeholder
+    /// inherits a bullet from the master, a plain text box is a paragraph.
+    #[test]
+    fn without_a_list_style_the_placeholder_default_stands() {
+        let dom = roxmltree::Document::parse(
+            r#"<p:sp xmlns:p="p" xmlns:a="a"><p:txBody><a:lstStyle/><a:p><a:r><a:t>x</a:t></a:r></a:p></p:txBody></p:sp>"#,
+        )
+        .unwrap();
+        let body = dom
+            .descendants()
+            .find(|n| n.has_tag_name("txBody"))
+            .unwrap();
+        let para = body.children().find(|n| n.has_tag_name("p")).unwrap();
+        assert_eq!(list_kind(para, Some(body), Placeholder::Body), Some(false));
+        assert_eq!(list_kind(para, Some(body), Placeholder::TextBox), None);
     }
 }

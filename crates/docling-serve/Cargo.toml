@@ -25,6 +25,8 @@ heif = ["docling/heif"]
 tensorrt = ["docling/tensorrt"]
 directml = ["docling/directml"]
 coreml = ["docling/coreml"]
+# CPU-class XNNPACK (#324): self-built ONNX Runtime only (ORT_LIB_LOCATION).
+xnnpack = ["docling/xnnpack"]
 # OpenTelemetry trace export (#297): request/conversion spans shipped over
 # OTLP when OTEL_EXPORTER_OTLP_ENDPOINT is set at runtime. Off by default —
 # the OTel SDK stack is heavy; structured tracing logs and the Prometheus
@@ -38,8 +40,8 @@ otel = [
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-docling = { path = "../docling", version = "1.31.0" }
-docling-core = { path = "../docling-core", version = "1.31.0" }
+docling = { path = "../docling", version = "1.50.3" }
+docling-core = { path = "../docling-core", version = "1.50.3" }
 # malloc_trim after conversions (#263): glibc's allocator otherwise keeps
 # freed page-bitmap heap mapped forever, ratcheting a warm server's RSS.
 libc = "0.2"

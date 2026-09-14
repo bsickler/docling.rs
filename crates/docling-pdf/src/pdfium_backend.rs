@@ -251,7 +251,7 @@ impl PdfDocument {
         let mut rust = rust_parser_cells(bytes);
         let mut pages = Vec::new();
         for (i, page) in doc.pages().iter().enumerate() {
-            let rc = rust.as_mut().and_then(|v| v.get_mut(i).map(std::mem::take));
+            let rc = rust.as_mut().map(|p| p.cells_timed(i));
             pages.push(extract_page(&page, &ffi, i as i32, rc, true, true)?);
         }
         Ok(PdfDocument { pages })
@@ -266,22 +266,34 @@ impl PdfDocument {
 /// to fall back to pdfium's text layer. The parser returns an empty page when a
 /// PDF (or a page) has no parseable text layer; the caller keeps pdfium's cells
 /// in that case, so scanned/edge-case pages are unaffected.
-fn rust_parser_cells(bytes: &[u8]) -> Option<Vec<crate::textparse::PageParserCells>> {
+fn rust_parser_cells(bytes: &[u8]) -> Option<crate::textparse::PageTextParser> {
     if docling_core::env::flag("DOCLING_PDFIUM_TEXT") {
         return None;
     }
-    Some(crate::timing::timed("textparse", || {
-        crate::textparse::pdf_all_cells(bytes)
-    }))
+    // Only the document load happens here; pages are parsed as the walk
+    // reaches them (`cells_timed`), so nothing is decoded for pages outside
+    // a `--pages` window and the parse overlaps the workers' inference.
+    crate::timing::timed("textparse.open", || {
+        crate::textparse::PageTextParser::open(bytes)
+    })
+}
+
+impl crate::textparse::PageTextParser {
+    /// [`cells`](Self::cells) under the `textparse` timing stage (per page).
+    fn cells_timed(&mut self, index: usize) -> crate::textparse::PageParserCells {
+        crate::timing::timed("textparse", || self.cells(index))
+    }
 }
 
 #[cfg(feature = "ml")]
 /// Number of pages in a PDF, without rendering any of them — used to decide
 /// whether a document is worth spinning up the parallel worker pool.
 pub fn page_count(bytes: &[u8], password: Option<&str>) -> Result<usize, PdfiumError> {
-    let pdfium = bind()?;
-    let doc = pdfium.load_pdf_from_byte_slice(bytes, password)?;
-    Ok(doc.pages().len() as usize)
+    crate::timing::timed("pdfium.page_count", || {
+        let pdfium = bind()?;
+        let doc = pdfium.load_pdf_from_byte_slice(bytes, password)?;
+        Ok(doc.pages().len() as usize)
+    })
 }
 
 #[cfg(feature = "ml")]
@@ -321,8 +333,12 @@ where
     F: FnMut(usize, usize, PdfPage) -> Result<(), E>,
 {
     let pdfium = bind()?;
-    let ffi = FfiText::load(pdfium.bindings(), bytes, password);
-    let doc = pdfium.load_pdf_from_byte_slice(bytes, password)?;
+    let (ffi, doc) = crate::timing::timed("pdfium.open", || {
+        let ffi = FfiText::load(pdfium.bindings(), bytes, password);
+        pdfium
+            .load_pdf_from_byte_slice(bytes, password)
+            .map(|doc| (ffi, doc))
+    })?;
     // `extract_text = false` (full-page OCR forced, docling#4061 / 2.122):
     // the text layer would be cleared unread, so neither the pure-Rust parser
     // nor pdfium's text page is decoded at all — on vector-dense pages (CAD
@@ -335,13 +351,26 @@ where
     let pages = doc.pages();
     let total = pages.len() as usize;
     let (first, last) = range.unwrap_or((0, total.saturating_sub(1)));
-    for (i, page) in pages.iter().enumerate() {
-        if i < first || i > last {
-            continue;
+    // Index the window directly: iterating `pages.iter()` from page 0 and
+    // skipping to `first` loads (and closes) every page before the window —
+    // ~0.7 ms each, 1.3 s of pure overhead for a one-page window over the
+    // 1913-page .NET reference.
+    for i in first..=last {
+        if i >= total {
+            break;
         }
-        let rc = rust.as_mut().and_then(|v| v.get_mut(i).map(std::mem::take));
+        let page = pages.get(i as pdfium_render::prelude::PdfPageIndex)?;
+        let rc = rust.as_mut().map(|p| p.cells_timed(i));
         let extracted = extract_page(&page, &ffi, i as i32, rc, render_image, extract_text)?;
         f(i, total, extracted)?;
+    }
+    // Tearing down the parsed document (hundreds of thousands of lopdf
+    // objects on a long PDF — 250 ms for the 1913-page .NET reference) is
+    // nobody's business but the allocator's: hand it to a detached thread so
+    // the last page's output isn't held up by it. `Arc`, not `Rc`, in the
+    // caches is what makes the parser `Send`.
+    if let Some(parser) = rust {
+        std::thread::spawn(move || crate::timing::timed("textparse.close", || drop(parser)));
     }
     Ok(())
 }
@@ -400,10 +429,11 @@ pub fn render_pages(
         }
     };
     let mut out = Vec::with_capacity(last.saturating_sub(first) + 1);
-    for (i, page) in pages.iter().enumerate() {
-        if i < first || i > last {
-            continue;
+    for i in first..=last {
+        if i >= total {
+            break;
         }
+        let page = pages.get(i as pdfium_render::prelude::PdfPageIndex)?;
         // pdfium applies /Rotate itself, so the bitmap is the page as a viewer
         // shows it — no orientation handling needed (the pipeline's scanned-page
         // un-rotation is an OCR-conformance concern, not a display one).

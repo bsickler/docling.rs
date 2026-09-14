@@ -42,7 +42,7 @@ validated for byte-for-byte conformance against upstream Python docling.
 | `crates/docling-core` | `DoclingDocument` model, Markdown/JSON/DCLX serializers, `MarkdownStreamer`, chunkers |
 | `crates/docling` | `DocumentConverter` (format routing), declarative backends (`src/backend/`), streaming (`src/stream.rs`), video (`src/video.rs`) |
 | `crates/docling-pdf` | ML pipeline: pdfium + RT-DETR layout + TableFormer + PP-OCRv3 + enrichment (`ml` feature); pure-Rust text-layer path compiles for wasm without it |
-| `crates/docling-onnx` | Shared ONNX Runtime execution-provider selection (`DOCLING_RS_EP`, `cuda`/`tensorrt`/`directml`/`coreml` features) for docling-pdf/docling-asr/docling-rag |
+| `crates/docling-onnx` | Shared ONNX Runtime execution-provider selection (`DOCLING_RS_EP`, `cuda`/`tensorrt`/`directml`/`coreml`/`xnnpack` features) for docling-pdf/docling-asr/docling-rag |
 | `crates/docling-asr` | Whisper ASR: symphonia decode (audio + video containers) → log-mel → ONNX encoder/decoder |
 | `crates/docling-cli` | `docling-rs` binary (also `serve` subcommand behind `--features serve`) |
 | `crates/docling-serve` | axum HTTP conversion API (+ Dockerfile with ffmpeg) |
@@ -88,6 +88,9 @@ cargo check -p docling --no-default-features --features pdf-text \
   `DOCLING_FFMPEG` (video frames — ffmpeg is a runtime binary, never a build
   dep), `DOCLING_RS_PDF_WORKERS/_THREADS/_INTRA`, `DOCLING_RS_TF_INTRA` (#262),
   `DOCLING_RS_NO_ARENA` (#263; serve defaults it on),
+  `DOCLING_RS_GRAPH_CACHE_DIR` / `DOCLING_RS_NO_GRAPH_CACHE` (ONNX Runtime
+  optimized-graph cache, CPU provider only), `DOCLING_RS_OCR_SESSIONS`
+  (parallel single-thread OCR lanes; byte-identical output),
   `DOCLING_RS_MAX_MEMORY_MB` + `DOCLING_RS_MEMORY_WATERMARK_PCT` (serve
   admission control), `DOCLING_RS_FP32`,
   `DOCLING_RS_EP` (GPU execution providers), `DOCLING_RS_ASR_LANG`,
@@ -109,11 +112,23 @@ cargo check -p docling --no-default-features --features pdf-text \
   formats must match Python docling **byte-for-byte**; the ML pipeline is
   pinned by deterministic snapshots (`tests/snapshots/`,
   `scripts/conformance/`, see `docs/PDF_CONFORMANCE.md`).
-- Output-regression suite: `crates/docling/tests/regression.rs` over
-  `crates/docling/tests/data`; regenerate intentional changes with
-  `DOCLING_RS_REGEN=1`.
+- Output-regression suite: `crates/docling/tests/regression.rs`, expected
+  outputs under `crates/docling/tests/data/<format>/expected/`; regenerate
+  intentional changes with `DOCLING_RS_REGEN=1`. **A source file lives in one
+  place only:** an upstream fixture goes in the root `tests/data/<format>/sources/`
+  and is covered by adding its name to `crates/docling/tests/data/<format>/mirror.txt`;
+  only fixtures of our own (formats docling lacks, our regression cases) go in
+  `crates/docling/tests/data/<format>/sources/`. The harness fails on a copy
+  that exists in both.
 - When touching serializers, keep the streaming and buffered paths
   byte-identical — `MarkdownStreamer` tests assert exactly that.
+- A `docling-core` serializer change reaches the **PDF** baselines too, and
+  neither runs in CI (both need pdfium + models): re-run
+  `scripts/conformance/pdf_conformance.sh` (snapshots) and
+  `scripts/conformance/pdf_groundtruth.sh` in the same PR, or the next person
+  reads the stale baseline as a pipeline regression. The groundtruth `.md` is a
+  serialization of the committed `groundtruth/*.json`, so a serializer-only
+  change is refreshed by re-exporting that JSON — no new docling run needed.
 
 ## Conventions that keep recurring
 

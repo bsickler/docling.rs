@@ -1013,6 +1013,7 @@ impl NodeBuilder {
             caption_href: None,
             image,
             classification: None,
+            caption_parent: Default::default(),
         };
         let plain = plain.trim().to_string();
         let text = markdown.trim().to_string();
@@ -1185,6 +1186,7 @@ impl NodeBuilder {
             cell_blocks: None,
             cells: None,
             caption: None,
+            caption_parent: Default::default(),
         }));
         self.last_ilfo = None;
         self.run_base = None;
@@ -1281,7 +1283,7 @@ mod tests {
 
     fn fixture(name: &str) -> SourceDocument {
         let path = format!(
-            "{}/tests/data/doc/sources/{name}",
+            "{}/../../tests/data/doc/sources/{name}",
             env!("CARGO_MANIFEST_DIR")
         );
         let bytes = std::fs::read(&path).expect("fixture exists");

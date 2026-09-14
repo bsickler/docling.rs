@@ -6,8 +6,9 @@ use crate::backend::{
     is_deepseek_markdown, AbwBackend, AsciiDocBackend, CsvBackend, DeclarativeBackend,
     DeepSeekBackend, DocBackend, DoclingJsonBackend, DocxBackend, EbcdicBackend, EmailBackend,
     EpubBackend, InterchangeBackend, JatsBackend, LatexBackend, LotusBackend, MarkdownBackend,
-    MhtmlBackend, PptBackend, PptxBackend, RtfBackend, StarOffice5Backend, UsptoBackend,
-    VisioBackend, WebVttBackend, XbrlBackend, XlsBackend, XlsxBackend,
+    MhtmlBackend, PptBackend, PptxBackend, QuattroBackend, RtfBackend, StarOffice5Backend,
+    UsptoBackend, VisioBackend, WebVttBackend, WpdBackend, WpsBackend, XbrlBackend, XlsBackend,
+    XlsxBackend,
 };
 
 /// Whether `text` begins with an XML prolog — an `<?xml …?>` declaration or a
@@ -337,13 +338,15 @@ impl DocumentConverter {
         self
     }
 
-    /// Fetch and embed external `<img>` images for HTML/EPUB sources.
+    /// Fetch and embed external `<img>` images for HTML/EPUB/MHTML/JATS sources.
     ///
     /// Off by default (matching docling's `enable_*_fetch=False`), so output is
-    /// unchanged unless you opt in. When on, the HTML/EPUB backends resolve each
-    /// `<img src>` — `data:` URIs, local files (relative to the source file's
-    /// directory), `http(s)` URLs, and EPUB archive entries — and embed the
-    /// bytes, so they survive into JSON `ImageRef`s and
+    /// unchanged unless you opt in. When on, the HTML/EPUB/MHTML backends
+    /// resolve each `<img src>` — `data:` URIs, local files (relative to the
+    /// source file's directory), `http(s)` URLs, and EPUB/MHTML archive
+    /// entries — and the JATS backend reads a `<fig>`'s `<graphic xlink:href>`
+    /// from the source file's directory (#392), embedding the bytes so they
+    /// survive into JSON `ImageRef`s and
     /// [`crate::DoclingDocument::export_to_markdown_with_images`].
     ///
     /// Remote `http(s)` URLs are fetched over the network; enable only for input
@@ -686,7 +689,12 @@ impl DocumentConverter {
                 // Optionally resolve the CSS cascade in a headless browser first
                 // (strips computed-hidden elements); everything else stays in the
                 // Rust HTML backend, which runs on the cleaned HTML.
-                let html = self.maybe_prerender(source.text()?)?;
+                // Bytes → text through docling's BeautifulSoup decoding order
+                // (#371): BOM, declared charset, UTF-8, windows-1252 — so a
+                // legacy windows-1252 page converts instead of failing the
+                // UTF-8 check every other text backend applies.
+                let decoded = crate::backend::decode_html_bytes(&source.bytes);
+                let html = self.maybe_prerender(&decoded)?;
                 if self.fetch_images {
                     let resolver = crate::backend::FsImageResolver::new(
                         source.base_dir().map(|p| p.to_path_buf()),
@@ -697,7 +705,10 @@ impl DocumentConverter {
                     crate::backend::convert_html(&source.name, &html, &crate::backend::NoFetch)
                 }
             }
-            InputFormat::Asciidoc => AsciiDocBackend.convert(&source)?,
+            InputFormat::Asciidoc => AsciiDocBackend {
+                fetch_images: self.fetch_images,
+            }
+            .convert(&source)?,
             InputFormat::Xlsx => XlsxBackend {
                 skip_empty: self.skip_empty_cells,
             }
@@ -709,6 +720,12 @@ impl DocumentConverter {
             InputFormat::Visio => VisioBackend.convert(&source)?,
             // AbiWord (#216): docling.rs extension, native AWML parse.
             InputFormat::Abiword => AbwBackend.convert(&source)?,
+            // WordPerfect 5.x/6.x+ (#216): docling.rs extension, native parse
+            // of the ÿWPC function-code stream.
+            InputFormat::WordPerfect => WpdBackend.convert(&source)?,
+            // Microsoft Works word processor (#216): docling.rs extension,
+            // native parse after libwps.
+            InputFormat::Works => WpsBackend.convert(&source)?,
             // StarOffice 5 binaries (#215): docling.rs extension, native CFB
             // parse (docling would go through LibreOffice).
             InputFormat::StarOffice5 => StarOffice5Backend.convert(&source)?,
@@ -720,6 +737,9 @@ impl DocumentConverter {
             // Lotus/Quattro/Works record streams (#216): one BOF-sniffing
             // backend for the whole DOS-era family.
             InputFormat::Lotus => LotusBackend.convert(&source)?,
+            // Quattro Pro (#216): docling.rs extension, native parse after
+            // libwps (DOS/Windows record streams, QPW OLE zones).
+            InputFormat::QuattroPro => QuattroBackend.convert(&source)?,
             InputFormat::Docx => DocxBackend.convert(&source)?,
             // Legacy binary Office (issue #127): parsed natively — docling
             // proper converts these through LibreOffice first (PR #3804).
@@ -739,6 +759,7 @@ impl DocumentConverter {
             }
             .convert(&source)?,
             InputFormat::Mhtml => MhtmlBackend {
+                fetch_images: self.fetch_images,
                 use_web_browser: self.use_web_browser,
             }
             .convert(&source)?,
@@ -755,7 +776,10 @@ impl DocumentConverter {
                 match sniff_xml(&source.bytes) {
                     InputFormat::XmlUspto => UsptoBackend.convert(&source)?,
                     InputFormat::XmlXbrl => XbrlBackend.convert(&source)?,
-                    _ => JatsBackend.convert(&source)?,
+                    _ => JatsBackend {
+                        fetch_images: self.fetch_images,
+                    }
+                    .convert(&source)?,
                 }
             }
             InputFormat::Odt | InputFormat::Ods | InputFormat::Odp => {

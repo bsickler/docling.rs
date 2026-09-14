@@ -47,8 +47,8 @@ pub enum InputFormat {
     Latex,
     Email,
     Epub,
-    /// MIME HTML archive (`.mhtml`/`.mht`) — a docling.rs extension; docling
-    /// has no MHTML backend.
+    /// MIME HTML archive (`.mhtml`/`.mht`) — docling's `InputFormat.MHTML`
+    /// (docling#4184), unwrapped and converted as HTML.
     Mhtml,
     /// Rich Text Format (`.rtf`) — a docling.rs extension (#209); docling
     /// converts RTF only by shelling out to LibreOffice.
@@ -62,8 +62,9 @@ pub enum InputFormat {
     /// (resvg) and rides the image pipeline; without ML — or under `--no-ocr`
     /// — `<text>` elements are extracted directly into flat paragraphs.
     Svg,
-    /// Apple Pages (`.pages`) — a docling.rs extension (#213); docling has
-    /// no iWork reader. Modern (2013+) IWA packages, text-level extraction.
+    /// Apple Pages (`.pages`) — a conformance format (#318, #383): mirrors
+    /// docling's `IWorkPagesDocumentBackend` for both the 2013+ IWA package
+    /// and the iWork '09 `index.xml` generation.
     Pages,
     /// Apple Numbers (`.numbers`), same IWA machinery as [`Self::Pages`].
     Numbers,
@@ -72,6 +73,15 @@ pub enum InputFormat {
     /// AbiWord (`.abw`/`.zabw`/`.awt`) — a docling.rs extension (#216);
     /// AWML XML (gzip-wrapped for `.zabw`), parsed natively.
     Abiword,
+    /// WordPerfect 5.x / 6.x+ documents (`.wpd`, `.wp`, `.wp5`, `.wp6`,
+    /// `.wpt`) — a docling.rs extension (#216); the `ÿWPC` byte stream is
+    /// parsed natively (docling reaches WordPerfect only via LibreOffice's
+    /// libwpd), text-level with bold/italic/underline runs.
+    WordPerfect,
+    /// Microsoft Works word-processor documents (`.wps`) — a docling.rs
+    /// extension (#216); Works 2.x DOS / 3 / 4 (`WPS4`) and Works 2000 / 6–9
+    /// (`WPS8`, OLE `CONTENTS`) parsed natively after libwps' readers.
+    Works,
     /// dBase table (`.dbf`) — a docling.rs extension (#216); the field
     /// descriptors become the header row, records the data rows.
     Dbf,
@@ -81,6 +91,10 @@ pub enum InputFormat {
     /// SYLK (`.slk`/`.sylk`) — a docling.rs extension (#216); same
     /// sheet-region conversion as DIF.
     Sylk,
+    /// Quattro Pro spreadsheets (`.wq1`/`.wq2` DOS, `.wb1`–`.wb3` Windows,
+    /// `.qpw` 9–X9) — a docling.rs extension (#216) parsed natively after
+    /// libwps' readers.
+    QuattroPro,
     /// Lotus 1-2-3 / Symphony / MS Works spreadsheets (`.wk1`–`.wk4`,
     /// `.wks`, `.wrk`, `.123`) — a docling.rs extension (#216); the DOS-era
     /// record streams, content-sniffed on the BOF record and split into data
@@ -136,10 +150,13 @@ impl InputFormat {
             InputFormat::Numbers => "numbers",
             InputFormat::Keynote => "key",
             InputFormat::Abiword => "abiword",
+            InputFormat::WordPerfect => "wordperfect",
+            InputFormat::Works => "works",
             InputFormat::Dbf => "dbf",
             InputFormat::Dif => "dif",
             InputFormat::Sylk => "sylk",
             InputFormat::Lotus => "lotus",
+            InputFormat::QuattroPro => "quattro",
             InputFormat::StarOffice5 => "staroffice5",
         }
     }
@@ -171,7 +188,9 @@ impl InputFormat {
             // `.xlsb` (binary Excel 2007+) parses through the same calamine
             // engine as xlsx — the backend detects the binary workbook part
             // and switches readers, issue #210.
-            "xlsx" | "xlsm" | "xlsb" => InputFormat::Xlsx,
+            // Excel templates (docling#4178, 2.126): the same OOXML package
+            // under the template content type.
+            "xlsx" | "xlsm" | "xlsb" | "xltx" | "xltm" => InputFormat::Xlsx,
             // Legacy binary Office (Word/Excel/PowerPoint 97–2003), issue #127.
             // Extension sets mirror docling's FormatToExtensions.
             "doc" | "dot" => InputFormat::Doc,
@@ -217,6 +236,16 @@ impl InputFormat {
             // AbiWord (#216): AWML XML; .zabw is the same file gzip-wrapped,
             // .awt the template flavor.
             "abw" | "zabw" | "awt" => InputFormat::Abiword,
+            // WordPerfect (#216): `.wp` was the DOS-era default (WP 5.x),
+            // `.wpd` the Windows one; `.wpt` is the template flavor. The
+            // backend reads the version from the prefix header, not the
+            // extension.
+            "wpd" | "wp" | "wp5" | "wp6" | "wpt" => InputFormat::WordPerfect,
+            // Microsoft Works word processor (#216): the backend tells the
+            // generations apart by the stream (raw 2.x header, OLE MN0 for
+            // 3/4, OLE CONTENTS for 2000+); .wks/.wdb are the spreadsheet
+            // and database and route elsewhere.
+            "wps" => InputFormat::Works,
             // Legacy spreadsheet-interchange relics (#216): all three parse
             // natively and content-sniff inside one backend.
             "dbf" => InputFormat::Dbf,
@@ -225,6 +254,14 @@ impl InputFormat {
             // The Lotus family (#216): .wks is ambiguous (1-2-3 rel 1A and
             // MS Works v3 both used it) — the backend sniffs the BOF.
             "wk1" | "wk2" | "wk3" | "wk4" | "wks" | "wrk" | "123" => InputFormat::Lotus,
+            // Quattro Pro (#216): the cell records differ per generation, so
+            // the family has its own reader (the backend sniffs the BOF /
+            // OLE stream, not the extension).
+            "wq1" | "wq2" | "wb1" | "wb2" | "wb3" | "qpw" => InputFormat::QuattroPro,
+            // MS Works 6–9 spreadsheet (#216): a BIFF8 `Workbook` stream in
+            // an OLE container — Excel 97's own layout under another
+            // extension, so the XLS reader takes it.
+            "xlr" => InputFormat::Xls,
             // StarOffice 5 binaries (#215): .vor templates dispatch by the
             // CFB stream inside (writer/draw/impress share the container).
             // .sdc routes here too so StarCalc gets its targeted

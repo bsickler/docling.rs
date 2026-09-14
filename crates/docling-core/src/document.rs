@@ -125,6 +125,9 @@ pub enum Node {
         /// Serialized as docling's `classification` annotation + `meta` field
         /// on the JSON picture item; Markdown/DocLang output is unaffected.
         classification: Option<Vec<PictureClass>>,
+        /// Where the caption item hangs in the JSON tree (#390); see
+        /// [`CaptionParent`]. Markdown, DocLang and LaTeX ignore it.
+        caption_parent: CaptionParent,
     },
     /// A display-math formula item decoded by the CodeFormula enrichment:
     /// `latex` is the model's LaTeX (no `$$` wrapping), `orig` the raw glyph
@@ -136,6 +139,14 @@ pub enum Node {
         orig: String,
         location: Option<[u16; 4]>,
     },
+    /// A standalone caption item (docling's `DocItemLabel.CAPTION` text that
+    /// no picture or table claims): the HTML backend emits a `<figure>`'s
+    /// `<figcaption>` this way when the figure produced no picture and its
+    /// first item is not a table (docling#4050). `href` is the caption's
+    /// hyperlink annotation (the first link inside the figcaption); Markdown
+    /// renders it as `[text](href)`, JSON puts `hyperlink` on the caption
+    /// item, DocLang emits the block-form `<caption>` with an `<href>` head.
+    Caption { text: String, href: Option<String> },
     /// A chart (docling's `PictureItem` classified as a chart, carrying a
     /// `PictureTabularChartData` annotation). Markdown and JSON render it exactly
     /// like a [`Node::Picture`] placeholder (an `<!-- image -->` / `picture`
@@ -151,8 +162,20 @@ pub enum Node {
         /// DocLang `<location>` provenance for the picture element.
         location: Option<[u16; 4]>,
     },
-    /// A logical grouping of child nodes (e.g. a list, a section).
-    Group { label: String, children: Vec<Node> },
+    /// A logical grouping of child nodes (e.g. a list, a section, a spreadsheet
+    /// sheet). `name` is docling's group name when it differs from the label —
+    /// an xlsx sheet group is `label: "sheet"`, `name: Some("Sheet1")`. `layer`
+    /// puts the group *and* everything it contains on a non-body content layer
+    /// (a hidden sheet is `invisible`), which is how the serializers that only
+    /// render body content know to skip it; DocLang stamps each child with the
+    /// layer token, exactly as a [`Node::Furniture`] wrapper on each would.
+    /// DocLang has no group element, so a group is transparent there.
+    Group {
+        label: String,
+        name: Option<String>,
+        layer: Option<ContentLayer>,
+        children: Vec<Node>,
+    },
     /// A form key-value region (docling's `field_region`): a set of form fields,
     /// each pairing an optional marker, key, and value. Backends detect these
     /// from form structure (e.g. HTML's `keyN` / `keyN_valueM` / `keyN_marker`
@@ -179,6 +202,39 @@ pub enum Node {
         layer: ContentLayer,
         inner: Box<Node>,
     },
+    /// One reviewer comment: docling's notes-layer `comment_section` group
+    /// holding a single text item. `name` is docling's own — `comment-{id}` for
+    /// a docx `w:comment`, `comment-{sheet}-{cell}` for a spreadsheet cell note.
+    /// JSON emits the group plus its notes-layer text; DocLang emits the flat
+    /// `<text><layer value="notes"/>…</text>` upstream writes (its DocLang
+    /// carries no group for comments); Markdown and LaTeX omit the notes layer.
+    ///
+    /// `refs_note_text` picks what a [`Node::Commented`] annotation points at,
+    /// mirroring an upstream asymmetry: docling-core's `add_comment` appends the
+    /// **note text**'s ref to each target (which is what the xlsx backend gets),
+    /// while the docx backend overwrites that with the **group**'s ref so a
+    /// comment's replies group together.
+    ///
+    /// `grouped` is whether docling wraps the note in a `comment_section`
+    /// group at all: the docx and spreadsheet backends do, while backends that
+    /// call docling-core's `add_comment` directly (Pages, #383) get a bare
+    /// notes-layer text item under the body — JSON then emits no group and
+    /// `name` is unused.
+    CommentSection {
+        name: String,
+        text: String,
+        refs_note_text: bool,
+        grouped: bool,
+    },
+    /// A body item annotated by reviewer comments: `comments` are indices into
+    /// the document's [`Node::CommentSection`] nodes, in document order. JSON
+    /// emits docling's `comments: [{"$ref": …}]` on the item, each ref pointing
+    /// where the section says (see [`Node::CommentSection::refs_note_text`]);
+    /// every other serializer renders `inner` unchanged.
+    Commented {
+        comments: Vec<usize>,
+        inner: Box<Node>,
+    },
     /// A node carrying layout provenance — the four DocLang `<location>` values
     /// (`x0,y0,x1,y1`, normalized to 0–511) docling attaches to elements from
     /// backends with real geometry (e.g. the slide shapes in PPTX). Markdown and
@@ -186,6 +242,29 @@ pub enum Node {
     /// tokens as the element's first children.
     Located {
         location: [u16; 4],
+        inner: Box<Node>,
+    },
+    /// Exact page provenance for a backend whose geometry already *is* the
+    /// page's coordinate system — an XLSX item's cell-index box on its sheet,
+    /// which docling writes verbatim (`bbox` in a top-left origin, the
+    /// `charspan` the backend chose) and sizes the page from. The 0–511 grid
+    /// of a [`Node::Located`] cannot round-trip such integers exactly, so the
+    /// JSON export reads this wrapper; every other serializer renders `inner`
+    /// unchanged (DocLang keeps taking its `<location>` tokens from the grid).
+    Prov {
+        page_no: usize,
+        /// `[l, t, r, b]`, page units, top-left origin.
+        bbox: [f32; 4],
+        /// docling's `charspan` for the item (`[0, 0]` for an XLSX table).
+        charspan: [usize; 2],
+        /// The item's creation rank among its siblings, when that differs
+        /// from the node order: docling numbers `#/tables/N` / `#/texts/N` /
+        /// `#/pictures/N` in the order it *creates* items (a sheet's tables,
+        /// then its images, then its charts) and only afterwards sorts the
+        /// container's children by position. The JSON export adds siblings in
+        /// this order and lays their refs out in node order; `None` when the
+        /// two orders coincide.
+        seq: Option<usize>,
         inner: Box<Node>,
     },
     /// A PDF page header or footer (docling's `page_header`/`page_footer`
@@ -398,6 +477,38 @@ pub struct TableCell {
     pub row_section: bool,
 }
 
+/// Where a picture's or table's caption text item hangs in the docling-JSON
+/// tree (#390). docling's backends do not agree, and the JSON structure is
+/// the only surface that shows it (Markdown, DocLang and LaTeX place a
+/// caption by its item, whatever its parent): the PDF pipeline parents a
+/// layout caption to the picture or table it belongs to, while every
+/// declarative backend creates the caption with `doc.add_text(label=CAPTION)`
+/// and no parent — the document body — even when the item itself sits in a
+/// group or under a section header (JATS, LaTeX, HTML, Markdown, EPUB,
+/// AsciiDoc all do). The office backends hang a chart's title caption off the
+/// chart's container (the sheet group, the slide, docx's current parent,
+/// docling#4190) — that is [`Node::Chart`]'s own path, not this choice. A
+/// backend that adds a new captioned item picks the variant matching
+/// upstream's `add_text` call for that format; the default is upstream's
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaptionParent {
+    /// `#/body`, listed after the enclosing top-level item — docling's
+    /// `add_text` default, which every declarative backend leaves alone.
+    #[default]
+    Body,
+    /// The item's own container (its `parent`), listed ahead of the item:
+    /// the caption is created first, as docling's office backends do.
+    Container,
+    /// The item's own container, listed *after* the item: docling's HTML
+    /// backend adds a `<figure>`-wrapped table, then its `<figcaption>` under
+    /// `self.parents[self.level]` (docling#4050).
+    ContainerAfter,
+    /// The item itself — the caption is the picture's or table's first
+    /// child, as docling's PDF pipeline attaches a layout caption.
+    Item,
+}
+
 /// A simple row-major table. By default `rows[0]` is the header row; a
 /// [`TableStructure`] overlay overrides that and adds column spans.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -428,6 +539,9 @@ pub struct Table {
     /// table references; DocLang emits a `<caption>` as the table's first child.
     /// `None` → the table has no caption.
     pub caption: Option<String>,
+    /// Where the caption item hangs in the JSON tree (#390); see
+    /// [`CaptionParent`]. Only the JSON export reads it.
+    pub caption_parent: CaptionParent,
     /// Optional per-cell bounding boxes, same shape as [`Self::rows`]: `[l, t,
     /// r, b]` in page points with a **top-left** origin (the PDF pipeline's
     /// native space). Set by the ML pipeline's TableFormer paths — a spanned
@@ -531,6 +645,43 @@ impl Table {
             }
         }
         cells
+    }
+
+    /// The number of leading grid rows that form the column header —
+    /// docling-core's `_count_header_rows` (docling-core#723, 2.96) shared by
+    /// the Markdown serializer and the chunker's dataframe view: a row counts
+    /// only when a `column_header` cell *starts* on it (a header spanning
+    /// several rows is replicated into each row it covers, and counting those
+    /// would pull the data rows beneath it into the header block). Two
+    /// special cases: `1` when no cell carries the flag at all, so tables from
+    /// backends that never set it keep row 0 as the header; `0` when flags
+    /// exist but none starts on row 0 — then nothing is promotable and every
+    /// row stays in the body. Uses the first-class [`Self::cells`] when
+    /// present (the PDF pipeline's TableFormer flags), else the cells derived
+    /// from the structure overlay.
+    ///
+    /// A pivot table's row headers no longer disturb this: docling#4216 flags
+    /// a spanning `<th>` row as `row_header`, not `column_header`, so the
+    /// first data row is no longer folded into the header block and the
+    /// deviation this port carried for docling-core#765 is gone.
+    pub fn header_row_count(&self) -> usize {
+        if self.rows.is_empty() {
+            return 0;
+        }
+        let derived;
+        let cells: &[TableCell] = match &self.cells {
+            Some(c) if !c.is_empty() => c,
+            _ => {
+                derived = self.derive_cells();
+                &derived
+            }
+        };
+        if !cells.iter().any(|c| c.column_header) {
+            return 1;
+        }
+        (0..self.rows.len())
+            .take_while(|&r| cells.iter().any(|c| c.column_header && c.start_row == r))
+            .count()
     }
 
     /// The first-class cell covering a grid position, if any.
@@ -684,7 +835,7 @@ impl DoclingDocument {
         fn unwrap_table(n: &Node) -> Option<&Table> {
             match n {
                 Node::Table(t) => Some(t),
-                Node::Located { inner, .. } => unwrap_table(inner),
+                Node::Located { inner, .. } | Node::Prov { inner, .. } => unwrap_table(inner),
                 _ => None,
             }
         }
@@ -699,7 +850,7 @@ impl DoclingDocument {
         fn unwrap_table(n: &mut Node) -> Option<&mut Table> {
             match n {
                 Node::Table(t) => Some(t),
-                Node::Located { inner, .. } => unwrap_table(inner),
+                Node::Located { inner, .. } | Node::Prov { inner, .. } => unwrap_table(inner),
                 _ => None,
             }
         }

@@ -474,6 +474,35 @@ type PageOut = (
 );
 
 #[cfg(feature = "ml")]
+/// A page between region resolution and TableFormer: what `prepare_page`
+/// produced and `complete_page` still needs, so a pool worker can park the
+/// page while another worker holds the shared TableFormer (see `Staged`).
+struct Prepared {
+    regions: Vec<layout::Region>,
+    ocr_confs: Vec<f32>,
+    parse: Option<f64>,
+}
+
+#[cfg(feature = "ml")]
+/// A pool worker's per-page outcome. `NeedsTables` is a page whose only
+/// remaining stage is the shared TableFormer, which was busy when the worker
+/// got there: rather than block on the mutex — one worker idle for the
+/// whole of another worker's table decode, ~9.5 s of the 60-page .NET slice
+/// on a 2-worker pool — the worker keeps the page aside, pulls the next one
+/// off the render channel, and comes back once the slot is free. Results
+/// are reassembled by page index anyway, so completion order is free.
+enum Staged {
+    Done(PageOut),
+    NeedsTables(Prepared),
+}
+
+#[cfg(feature = "ml")]
+/// How many pages a pool worker keeps parked on the TableFormer before it
+/// falls back to waiting: each carries its ~5 MB bitmaps, so this bounds the
+/// extra residency to two pages per worker on top of the render channel.
+const MAX_DEFERRED_PAGES: usize = 2;
+
+#[cfg(feature = "ml")]
 /// The pool-wide TableFormer slot: one instance shared by every worker, loaded
 /// lazily on the first table region any worker sees. Tables appear on a
 /// minority of pages, so per-worker copies mostly multiplied ~0.4 GB of
@@ -582,6 +611,10 @@ struct Worker {
     /// `None` when `no_ocr` skips layout entirely — no model load, no inference.
     layout: Option<layout::LayoutModel>,
     ocr: OcrSlot,
+    /// This worker's intra-op thread budget — also the OCR lane count (see
+    /// [`ocr::OcrModel::load_with`]): a pool worker with two threads runs two
+    /// single-thread recognisers, the primary as many as its cores.
+    intra: usize,
     /// Shared TableFormer slot; `None` when `no_table_former`/`no_ocr` skip it.
     tables: Option<SharedTables>,
     /// Shared enrichment slots; `None` unless the corresponding flag is on.
@@ -639,6 +672,7 @@ impl Worker {
                 Some(layout::LayoutModel::load_with(intra).map_err(PdfError::Layout)?)
             },
             ocr: OcrSlot::Unloaded,
+            intra,
             tables,
             classifier: enrich_slots.0,
             code_formula: enrich_slots.1,
@@ -663,7 +697,7 @@ impl Worker {
             return Ok(None);
         }
         if matches!(self.ocr, OcrSlot::Unloaded) {
-            match ocr::OcrModel::load(self.ocr_lang) {
+            match ocr::OcrModel::load_with(self.ocr_lang, self.intra) {
                 Ok(model) => self.ocr = OcrSlot::Ready(model),
                 Err(e) if self.force_full_page_ocr => return Err(PdfError::Ocr(e)),
                 Err(e) => {
@@ -755,14 +789,14 @@ impl Worker {
     /// then run each page's remaining stages (OCR / TableFormer / enrichment /
     /// assembly) per page. Index-aligned with `items`; a layout failure fails
     /// every page in the batch (they shared the one inference call).
-    fn process_batch(&mut self, items: &mut [(usize, PdfPage)]) -> Vec<Result<PageOut, PdfError>> {
+    fn process_batch(&mut self, items: &mut [(usize, PdfPage)]) -> Vec<Result<Staged, PdfError>> {
         if self.no_ocr {
             // No layout model to batch — the text-layer-only path is per page.
             return items
                 .iter_mut()
                 .map(|(n, page)| {
                     let n = *n;
-                    self.process(n, page)
+                    self.process(n, page).map(Staged::Done)
                 })
                 .collect();
         }
@@ -794,7 +828,7 @@ impl Worker {
             Ok(all) => items
                 .iter_mut()
                 .zip(all)
-                .map(|((n, page), regions)| self.finish_page(*n, page, regions))
+                .map(|((n, page), regions)| self.stage_page(*n, page, regions))
                 .collect(),
             Err(e) => items
                 .iter()
@@ -803,15 +837,226 @@ impl Worker {
         }
     }
 
+    /// A pool worker's main loop: pull rendered pages off the shared channel
+    /// (whatever is already there, up to the layout batch size), process them,
+    /// and hand each finished page — or its error — to `deliver`, which returns
+    /// `false` to stop early (the streaming consumer went away). Returns when
+    /// the channel is closed and every page this worker took is delivered.
+    ///
+    /// Pages whose TableFormer turn would have to wait are parked (see
+    /// `Staged`) and retried before every new pull; while any are parked the
+    /// pull is non-blocking, so an empty channel means the worker waits for
+    /// the TableFormer rather than for the renderer. The parking budget
+    /// (`MAX_DEFERRED_PAGES`) bounds resident bitmaps; past it the worker waits
+    /// like the serial path. Output is independent of completion order — the
+    /// callers reassemble by page index.
+    fn run_pool(
+        &mut self,
+        work_rx: &Mutex<Receiver<(usize, PdfPage)>>,
+        layout_batch: usize,
+        mut deliver: impl FnMut(usize, Result<PageOut, PdfError>) -> bool,
+    ) {
+        use std::sync::mpsc::TryRecvError;
+        let mut deferred: std::collections::VecDeque<(usize, PdfPage, Prepared)> =
+            std::collections::VecDeque::new();
+        loop {
+            // Any parked page the slot has since freed up for, oldest first.
+            let mut i = 0;
+            while i < deferred.len() {
+                let (_, page, prepared) = &deferred[i];
+                match self.table_rows_try(page, &prepared.regions) {
+                    Some(rows) => {
+                        let (idx, mut page, prepared) = deferred.remove(i).expect("index in range");
+                        if !deliver(idx, self.complete_page(idx, &mut page, prepared, rows)) {
+                            return;
+                        }
+                    }
+                    None => i += 1,
+                }
+            }
+            // Hold the receiver lock only for the recv (plus a non-blocking drain
+            // up to the layout batch size); release before the (long) per-page
+            // work so other workers can pull concurrently.
+            let mut batch: Vec<(usize, PdfPage)> = Vec::new();
+            let mut closed = false;
+            {
+                let rx = work_rx.lock().unwrap();
+                let first = if deferred.is_empty() {
+                    rx.recv().map_err(|_| TryRecvError::Disconnected)
+                } else {
+                    rx.try_recv()
+                };
+                match first {
+                    Ok(item) => {
+                        batch.push(item);
+                        while batch.len() < layout_batch {
+                            match rx.try_recv() {
+                                Ok(item) => batch.push(item),
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(TryRecvError::Empty) => {}
+                    Err(TryRecvError::Disconnected) => closed = true,
+                }
+            }
+            if batch.is_empty() {
+                // Nothing new rendered (or the channel is closed): wait our turn
+                // on the oldest parked page instead.
+                match deferred.pop_front() {
+                    Some((idx, mut page, prepared)) => {
+                        let rows = self.table_rows_blocking(&page, &prepared.regions);
+                        if !deliver(idx, self.complete_page(idx, &mut page, prepared, rows)) {
+                            return;
+                        }
+                        continue;
+                    }
+                    None if closed => return,
+                    None => continue,
+                }
+            }
+            let outs = self.process_batch(&mut batch);
+            for ((idx, mut page), out) in batch.into_iter().zip(outs) {
+                let delivered = match out {
+                    Ok(Staged::Done(out)) => deliver(idx, Ok(out)),
+                    Ok(Staged::NeedsTables(prepared)) => {
+                        if deferred.len() < MAX_DEFERRED_PAGES {
+                            deferred.push_back((idx, page, prepared));
+                            true
+                        } else {
+                            let rows = self.table_rows_blocking(&page, &prepared.regions);
+                            deliver(idx, self.complete_page(idx, &mut page, prepared, rows))
+                        }
+                    }
+                    Err(e) => deliver(idx, Err(e)),
+                };
+                if !delivered {
+                    return;
+                }
+            }
+        }
+    }
+
     /// Everything after layout detection: per-label confidence thresholds,
     /// overlap resolution, orphan-text recovery, OCR for cell-less pages,
-    /// TableFormer, enrichment, and page assembly.
+    /// TableFormer, enrichment, and page assembly. The serial path: waits
+    /// for the shared TableFormer when a table needs it.
     fn finish_page(
         &mut self,
         n: usize,
         page: &mut PdfPage,
         regions: Vec<layout::Region>,
     ) -> Result<PageOut, PdfError> {
+        let prepared = self.prepare_page(n, page, regions)?;
+        let table_rows = self.table_rows_blocking(page, &prepared.regions);
+        self.complete_page(n, page, prepared, table_rows)
+    }
+
+    /// The pool path: like [`finish_page`](Self::finish_page), except that a
+    /// page whose TableFormer turn would have to wait comes back as
+    /// [`Staged::NeedsTables`] for the worker loop to park (see `Staged`).
+    fn stage_page(
+        &mut self,
+        n: usize,
+        page: &mut PdfPage,
+        regions: Vec<layout::Region>,
+    ) -> Result<Staged, PdfError> {
+        let prepared = self.prepare_page(n, page, regions)?;
+        match self.table_rows_try(page, &prepared.regions) {
+            Some(rows) => Ok(Staged::Done(self.complete_page(n, page, prepared, rows)?)),
+            None => Ok(Staged::NeedsTables(prepared)),
+        }
+    }
+
+    /// Does this page need the shared TableFormer at all? Table-free pages
+    /// never touch (or load) it.
+    fn needs_tables(&self, regions: &[layout::Region]) -> bool {
+        self.tables.is_some() && regions.iter().any(|r| assemble::is_table_like(r.label))
+    }
+
+    /// TableFormer structure for every table region of the page, on an
+    /// already-locked slot (loading the model on first use). Tables serialise
+    /// on this mutex, so the one instance gets the shared thread budget
+    /// (quota-aware, #262) — DOCLING_RS_TF_INTRA narrows it further where the
+    /// memory-per-thread tradeoff matters more than table latency.
+    fn predict_tables(
+        guard: &mut TfSlot,
+        page: &PdfPage,
+        regions: &[layout::Region],
+    ) -> Vec<Option<tf_core::TableGrid>> {
+        let mut table_rows: Vec<Option<tf_core::TableGrid>> = vec![None; regions.len()];
+        if matches!(*guard, TfSlot::Unloaded) {
+            *guard = match tableformer::TableFormer::load_with(tf_intra()) {
+                Some(tf) => TfSlot::Ready(tf),
+                None => TfSlot::Missing,
+            };
+        }
+        if let TfSlot::Ready(tf) = guard {
+            // One 1024-px frame per page, shared by all of its tables, and one
+            // call for all of them: with the dynamic-batch decoder their
+            // decode steps are shared (each step costs about the same for B
+            // tables as for one).
+            let page1024 = tableformer::TableFormer::page_1024(&page.image);
+            let (idx, boxes): (Vec<usize>, Vec<[f32; 4]>) = regions
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| assemble::is_table_like(r.label))
+                .map(|(i, r)| (i, [r.l, r.t, r.r, r.b]))
+                .unzip();
+            let rows =
+                tf.predict_tables_on(page.image.height(), &page1024, &boxes, &page.word_cells);
+            for (i, grid) in idx.into_iter().zip(rows) {
+                table_rows[i] = grid;
+            }
+        }
+        table_rows
+    }
+
+    /// Table structure for the page, waiting for the shared slot if another
+    /// worker holds it (else geometric fallback downstream when there is no
+    /// TableFormer at all). The `tableformer` timing stage here includes any
+    /// wait.
+    fn table_rows_blocking(
+        &self,
+        page: &PdfPage,
+        regions: &[layout::Region],
+    ) -> Vec<Option<tf_core::TableGrid>> {
+        match self.tables.as_ref().filter(|_| self.needs_tables(regions)) {
+            Some(slot) => timing::timed("tableformer", || {
+                Self::predict_tables(&mut slot.lock().unwrap(), page, regions)
+            }),
+            None => vec![None; regions.len()],
+        }
+    }
+
+    /// Non-blocking variant: `None` when the slot is held by another worker
+    /// right now — the caller parks the page and tries again later.
+    fn table_rows_try(
+        &self,
+        page: &PdfPage,
+        regions: &[layout::Region],
+    ) -> Option<Vec<Option<tf_core::TableGrid>>> {
+        let Some(slot) = self.tables.as_ref().filter(|_| self.needs_tables(regions)) else {
+            return Some(vec![None; regions.len()]);
+        };
+        match slot.try_lock() {
+            Ok(mut guard) => Some(timing::timed("tableformer", || {
+                Self::predict_tables(&mut guard, page, regions)
+            })),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(e)) => panic!("TableFormer slot poisoned: {e}"),
+        }
+    }
+
+    /// The stages before TableFormer: fp32 escalation, per-label confidence
+    /// thresholds, overlap resolution, orphan-text recovery, OCR for cell-less
+    /// pages, in-picture text and table-word recognition.
+    fn prepare_page(
+        &mut self,
+        n: usize,
+        page: &mut PdfPage,
+        regions: Vec<layout::Region>,
+    ) -> Result<Prepared, PdfError> {
         // Force-OCR is exactly "pretend the text layer is not there": clear
         // every cell kind the extractors produced before anything reads them,
         // and the ordinary no-text-layer machinery below — full-page OCR,
@@ -1087,39 +1332,31 @@ impl Worker {
                 page.word_cells.extend(words);
             }
         }
-        // TableFormer structure per table region (else geometric fallback). The
-        // shared slot is only locked (and lazily loaded) when the page actually
-        // has a table, so table-free documents never pay for TableFormer at all.
-        let mut table_rows: Vec<Option<tf_core::TableGrid>> = vec![None; regions.len()];
-        if let Some(slot) = self.tables.as_ref() {
-            if regions.iter().any(|r| assemble::is_table_like(r.label)) {
-                timing::timed("tableformer", || {
-                    let mut guard = slot.lock().unwrap();
-                    if matches!(*guard, TfSlot::Unloaded) {
-                        // Tables serialise on this mutex, so the one instance
-                        // gets the shared thread budget (quota-aware, #262) —
-                        // DOCLING_RS_TF_INTRA narrows it further where the
-                        // memory-per-thread tradeoff matters more than table
-                        // latency.
-                        *guard = match tableformer::TableFormer::load_with(tf_intra()) {
-                            Some(tf) => TfSlot::Ready(tf),
-                            None => TfSlot::Missing,
-                        };
-                    }
-                    if let TfSlot::Ready(tf) = &mut *guard {
-                        for (i, r) in regions.iter().enumerate() {
-                            if assemble::is_table_like(r.label) {
-                                table_rows[i] = tf.predict_table_rows(
-                                    &page.image,
-                                    [r.l, r.t, r.r, r.b],
-                                    &page.word_cells,
-                                );
-                            }
-                        }
-                    }
-                });
-            }
-        }
+        // The cells are final: fit every regular region to the cells it
+        // claims and fold the orphans it now surrounds (#419), before
+        // TableFormer and the reading order see the boxes.
+        assemble::fit_regions_to_cells(&mut regions, &page.cells);
+        Ok(Prepared {
+            regions,
+            ocr_confs,
+            parse,
+        })
+    }
+
+    /// The stages after TableFormer: enrichment, the page confidence report and
+    /// assembly into typed nodes.
+    fn complete_page(
+        &mut self,
+        n: usize,
+        page: &mut PdfPage,
+        prepared: Prepared,
+        table_rows: Vec<Option<tf_core::TableGrid>>,
+    ) -> Result<PageOut, PdfError> {
+        let Prepared {
+            regions,
+            ocr_confs,
+            parse,
+        } = prepared;
         if env::flag("DOCLING_RS_DEBUG_REGIONS") {
             for (i, r) in regions.iter().enumerate() {
                 eprintln!(
@@ -1270,14 +1507,22 @@ fn pdf_intra() -> usize {
 
 #[cfg(feature = "ml")]
 /// How many page-workers to spin up for a multi-page PDF. `DOCLING_RS_PDF_WORKERS`
-/// overrides; otherwise size the pool so `workers × intra ≈ cores`, capped at 4 so
-/// a worst-case pool holds a bounded amount of model memory (~0.4 GB per worker)
-/// and does not oversaturate the memory bus with model-weight traffic.
+/// overrides; otherwise size the pool so `workers × intra ≈ cores`.
+///
+/// The pool scales with the machine (#324 follow-up testing): the old hard cap
+/// of 4 left most of a many-core box idle — on a 16-core M4 Max, 10 workers
+/// measured ~1.2× over the capped pool (10.0 → 8.5 s on a 130-page document,
+/// byte-identical output). The ceiling of 16 is a memory bound, not a
+/// performance one: each worker holds its own layout/OCR sessions (~0.4 GB),
+/// so a worst-case pool stays under ~6.5 GB even on a ≥32-core host — and
+/// docling-serve's per-request pools sit behind its `DOCLING_RS_MAX_MEMORY_MB`
+/// admission control besides. Machines with 4 or fewer effective threads keep
+/// the exact old sizing (`threads / intra`, min 1).
 fn pdf_worker_count() -> usize {
     if let Some(n) = env::parse::<usize>("DOCLING_RS_PDF_WORKERS").filter(|&n| n > 0) {
         return n;
     }
-    (intra_threads() / pdf_intra()).clamp(1, 4)
+    (intra_threads() / pdf_intra()).clamp(1, 16)
 }
 
 #[cfg(feature = "ml")]
@@ -1286,17 +1531,22 @@ fn pdf_worker_count() -> usize {
 /// whatever is already rendered gets batched, so batching never *waits* for
 /// pages and adds no latency when rendering is the bottleneck.
 ///
-/// Default: 4 on 8+ cores, 1 (per-page) below. Measured on a 4-core box the
-/// batch only adds cache pressure and costs pipeline overlap (2 workers × 2
-/// threads: 8.1 s/conv at batch=1 vs 9.3 s at batch=4 on the 9-page
-/// 2206.01062 fixture); the single-session amortization it buys needs the
-/// wider thread budget of a many-core machine. Output is bit-identical at
-/// every batch size, so this is purely a throughput knob.
-/// `DOCLING_RS_PDF_LAYOUT_BATCH` overrides; `1` restores per-page inference.
-fn pdf_layout_batch() -> usize {
+/// Default: per-page (1) on the CPU provider, 4 when a GPU provider is
+/// selected (#338). The old "4 on 8+ cores" CPU default was a hypothesis —
+/// that single-session amortization pays off with a wider thread budget —
+/// and every actual CPU measurement lands the other way: a 4-core x86 box
+/// runs the 9-page 2206.01062 fixture in 8.5 s/conv at batch=1 vs 9.3 s at
+/// batch=4 (re-measured for #338; the original 8.1 vs 9.3 agrees), and the
+/// issue-#338 report measured batch=1 ~2× faster on a 16-core M4 Max at
+/// every worker count — batching only adds cache pressure once workers
+/// saturate the cores. On a GPU the per-call dispatch overhead is real and
+/// batching amortizes it, so the GPU default stays. Output is bit-identical
+/// at every batch size, so this is purely a throughput knob.
+/// `DOCLING_RS_PDF_LAYOUT_BATCH` overrides either way; `1` = per-page.
+pub(crate) fn pdf_layout_batch() -> usize {
     env::parse::<usize>("DOCLING_RS_PDF_LAYOUT_BATCH")
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| if intra_threads() >= 8 { 4 } else { 1 })
+        .unwrap_or_else(|| if docling_onnx::prefers_fp32() { 4 } else { 1 })
 }
 
 #[cfg(feature = "ml")]
@@ -1817,31 +2067,11 @@ impl Pipeline {
                 let first_err = Arc::clone(&first_err);
                 let progress = progress.clone();
                 let pages_done = &pages_done;
-                s.spawn(move || loop {
-                    // Hold the receiver lock only for the recv (plus a non-blocking
-                    // drain up to the layout batch size); release before the (long)
-                    // per-page work so other workers can pull concurrently.
-                    let mut batch = Vec::new();
-                    {
-                        let rx = work_rx.lock().unwrap();
-                        match rx.recv() {
-                            Ok(item) => {
-                                batch.push(item);
-                                while batch.len() < layout_batch {
-                                    match rx.try_recv() {
-                                        Ok(item) => batch.push(item),
-                                        Err(_) => break,
-                                    }
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let outs = worker.process_batch(&mut batch);
-                    for ((idx, _), out) in batch.iter().zip(outs) {
+                s.spawn(move || {
+                    worker.run_pool(&work_rx, layout_batch, |idx, out| {
                         match out {
                             Ok(out) => {
-                                results.lock().unwrap().push((*idx, out));
+                                results.lock().unwrap().push((idx, out));
                                 if let Some(cb) = &progress {
                                     let d = pages_done
                                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -1856,7 +2086,8 @@ impl Pipeline {
                                 }
                             }
                         }
-                    }
+                        true
+                    });
                 });
             }
             // Render on this thread and feed the workers; backpressure blocks here
@@ -2016,29 +2247,11 @@ impl Pipeline {
             for worker in workers.iter_mut() {
                 let work_rx = Arc::clone(&work_rx);
                 let res_tx = res_tx.clone();
-                s.spawn(move || 'outer: loop {
-                    let mut batch = Vec::new();
-                    {
-                        let rx = work_rx.lock().unwrap();
-                        match rx.recv() {
-                            Ok(item) => {
-                                batch.push(item);
-                                while batch.len() < layout_batch {
-                                    match rx.try_recv() {
-                                        Ok(item) => batch.push(item),
-                                        Err(_) => break,
-                                    }
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    let outs = worker.process_batch(&mut batch);
-                    for ((idx, _), out) in batch.iter().zip(outs) {
-                        if res_tx.send(out.map(|o| (*idx, o))).is_err() {
-                            break 'outer; // consumer gone
-                        }
-                    }
+                s.spawn(move || {
+                    worker.run_pool(&work_rx, layout_batch, |idx, out| {
+                        // `false` once the consumer is gone.
+                        res_tx.send(out.map(|o| (idx, o))).is_ok()
+                    });
                 });
             }
             // Renderer: feed pages to the pool on its own thread (pdfium stays on a

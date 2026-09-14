@@ -38,6 +38,12 @@
 //!   `no_text_panels`, `heading_hierarchy` — PDF/image pipeline switches (`skip_ocr`, #244: keep
 //!   layout + TableFormer, never OCR — docling's independent `do_ocr=False`;
 //!   `no_ocr` skips the whole ML stack)
+//! - `do_picture_classification`, `do_code_enrichment`,
+//!   `do_formula_enrichment` — the opt-in enrichment models (#423; docling's
+//!   `PdfPipelineOptions` flags of the same names, the CLI's
+//!   `--enrich-picture-classes` / `--enrich-code` / `--enrich-formula`):
+//!   DocumentFigureClassifier over pictures, CodeFormulaV2 over code / formula
+//!   regions. Off by default; a missing model warns and skips the pass
 //! - `pages` — PDF page window `A-B` / `N` (1-based inclusive, #80)
 //! - `ocr_lang` — OCR recognition language for scanned pages: `en` (default)
 //!   | `ch` (the multilingual docling-conformance model)
@@ -48,7 +54,7 @@
 //! - `ocr_scale` — OCR render scale in px per PDF point (docling's
 //!   `OcrOptions.scale`, #254); unset reads the pipeline's own 2.0 px/pt
 //!   render, docling's default is 3 (216 dpi)
-//! - `fetch_images` — resolve external `<img src>` for HTML/EPUB (outbound
+//! - `fetch_images` — resolve external `<img src>` for HTML/EPUB/MHTML/JATS (outbound
 //!   fetch, so honored only under `--allow-url-fetch`)
 //! - `skip_empty_cells` — omit empty cells from sparse XLSX/XLS table grids
 //!   (#271; docling.rs extension, off by default)
@@ -135,7 +141,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use docling::{
-    DoclingDocument, DocumentConverter, ImageMode, InputFormat, Pipeline, SourceDocument,
+    ConversionError, DoclingDocument, DocumentConverter, ImageMode, InputFormat, Pipeline,
+    SourceDocument,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -418,6 +425,16 @@ struct ConvertOptions {
     /// `HeadingHierarchyModel`: bookmarks > numbering > font style). Off by
     /// default — headings then keep the flat level the pipeline emits.
     heading_hierarchy: Option<bool>,
+    /// Opt-in enrichment models (#423), named as docling's
+    /// `PdfPipelineOptions` flags (and Python docling-serve's options):
+    /// classify pictures with DocumentFigureClassifier (26 classes → the JSON
+    /// picture item's `classification` annotation), rewrite code blocks with
+    /// CodeFormulaV2 (+ `code_language`), decode display formulas to LaTeX.
+    /// Each enabled pass lazily loads its model on the first matching region;
+    /// a missing model warns once and the pass is skipped.
+    do_picture_classification: Option<bool>,
+    do_code_enrichment: Option<bool>,
+    do_formula_enrichment: Option<bool>,
     fetch_images: Option<bool>,
     /// Email (.eml/.msg): append an Attachments section — names and content
     /// types only, never the payload (#251).
@@ -501,6 +518,11 @@ impl ConvertOptions {
             no_table_former: self.no_table_former.or(base.no_table_former),
             no_text_panels: self.no_text_panels.or(base.no_text_panels),
             heading_hierarchy: self.heading_hierarchy.or(base.heading_hierarchy),
+            do_picture_classification: self
+                .do_picture_classification
+                .or(base.do_picture_classification),
+            do_code_enrichment: self.do_code_enrichment.or(base.do_code_enrichment),
+            do_formula_enrichment: self.do_formula_enrichment.or(base.do_formula_enrichment),
             fetch_images: self.fetch_images.or(base.fetch_images),
             list_attachments: self.list_attachments.or(base.list_attachments),
             skip_empty_cells: self.skip_empty_cells.or(base.skip_empty_cells),
@@ -1835,6 +1857,9 @@ async fn read_multipart(
             | "force_full_page_ocr"
             | "no_text_panels"
             | "heading_hierarchy"
+            | "do_picture_classification"
+            | "do_code_enrichment"
+            | "do_formula_enrichment"
             | "fetch_images"
             | "list_attachments"
             | "skip_empty_cells"
@@ -1850,6 +1875,9 @@ async fn read_multipart(
                     "no_table_former" => body_opts.no_table_former = Some(b),
                     "no_text_panels" => body_opts.no_text_panels = Some(b),
                     "heading_hierarchy" => body_opts.heading_hierarchy = Some(b),
+                    "do_picture_classification" => body_opts.do_picture_classification = Some(b),
+                    "do_code_enrichment" => body_opts.do_code_enrichment = Some(b),
+                    "do_formula_enrichment" => body_opts.do_formula_enrichment = Some(b),
                     "list_attachments" => body_opts.list_attachments = Some(b),
                     "skip_empty_cells" => body_opts.skip_empty_cells = Some(b),
                     "compact_tables" => body_opts.compact_tables = Some(b),
@@ -2267,12 +2295,19 @@ fn convert_document_inner(
 /// the cached instance — a later default request found the slot filled and
 /// reused the reduced pipeline, silently returning flat no-OCR output until
 /// the server restarted.
+///
+/// The enrichment flags (#423) belong here too: the workers copy them at load
+/// and the model slots exist only for enabled passes, so a change of
+/// enrichment is a rebuild, not a setter. Steady traffic with one enrichment
+/// mix keeps its warm instance; only a *change* of mix reloads (the enrichment
+/// models themselves load lazily on the first matching region anyway).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PipelineFlags {
     no_ocr: bool,
     skip_ocr: bool,
     no_table_former: bool,
     no_text_panels: bool,
+    enrich: docling::EnrichmentOptions,
 }
 
 impl PipelineFlags {
@@ -2282,7 +2317,17 @@ impl PipelineFlags {
             skip_ocr: options.skip_ocr.unwrap_or(false),
             no_table_former: options.no_table_former.unwrap_or(false),
             no_text_panels: options.no_text_panels.unwrap_or(false),
+            enrich: enrichments(options),
         }
+    }
+}
+
+/// The request's enrichment passes (#423), all off unless asked for.
+fn enrichments(options: &ConvertOptions) -> docling::EnrichmentOptions {
+    docling::EnrichmentOptions {
+        picture_classification: options.do_picture_classification.unwrap_or(false),
+        code: options.do_code_enrichment.unwrap_or(false),
+        formula: options.do_formula_enrichment.unwrap_or(false),
     }
 }
 
@@ -2304,7 +2349,8 @@ fn warm_pipeline<'a>(
             .no_ocr(flags.no_ocr)
             .skip_ocr(flags.skip_ocr)
             .no_table_former(flags.no_table_former)
-            .no_text_panels(flags.no_text_panels);
+            .no_text_panels(flags.no_text_panels)
+            .enrichments(flags.enrich);
         *slot = Some((flags, p));
     }
     Ok(&mut slot.as_mut().expect("just filled").1)
@@ -2340,7 +2386,10 @@ fn request_converter(
         .force_full_page_ocr(options.force_full_page_ocr.unwrap_or(false))
         .no_table_former(options.no_table_former.unwrap_or(false))
         .no_text_panels(options.no_text_panels.unwrap_or(false))
-        .heading_hierarchy(options.heading_hierarchy.unwrap_or(false));
+        .heading_hierarchy(options.heading_hierarchy.unwrap_or(false))
+        .do_picture_classification(options.do_picture_classification.unwrap_or(false))
+        .do_code_enrichment(options.do_code_enrichment.unwrap_or(false))
+        .do_formula_enrichment(options.do_formula_enrichment.unwrap_or(false));
     if let Some(pages) = &options.pages {
         let (first, last) =
             docling::parse_page_range(pages).map_err(|e| ApiError::Bad(format!("pages: {e}")))?;
@@ -2408,7 +2457,7 @@ async fn stream_markdown(
     // confidence summary header — computable only after conversion, which is
     // exactly when the PDF/image branch sends its single chunk.
     type Chunk = (String, Option<header::HeaderValue>);
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Chunk, String>>(8);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Chunk, ApiError>>(8);
     let st = state.clone();
     tokio::task::spawn_blocking(move || {
         // Held until this worker (and thus the response body) is done.
@@ -2421,7 +2470,7 @@ async fn stream_markdown(
             }
         }
         let _trim = TrimOnDrop;
-        let send = |item: Result<Chunk, String>| {
+        let send = |item: Result<Chunk, ApiError>| {
             // The receiver disappearing means the client went away — stop.
             tx.blocking_send(item).is_ok()
         };
@@ -2451,14 +2500,14 @@ async fn stream_markdown(
                     send(Ok((md, confidence_header(&doc))));
                 }
                 Err(e) => {
-                    send(Err(api_error_message(e)));
+                    send(Err(e));
                 }
             }
         } else {
             let converter = match request_converter(&st, &options) {
                 Ok(c) => c,
                 Err(e) => {
-                    send(Err(api_error_message(e)));
+                    send(Err(e));
                     return;
                 }
             };
@@ -2478,7 +2527,7 @@ async fn stream_markdown(
                             }
                             Err(e) => {
                                 o11y::record_conversion(false);
-                                send(Err(e.to_string()));
+                                send(Err(conversion_api_error(&e)));
                                 return;
                             }
                         }
@@ -2487,7 +2536,7 @@ async fn stream_markdown(
                 }
                 Err(e) => {
                     o11y::record_conversion(false);
-                    send(Err(e.to_string()));
+                    send(Err(conversion_api_error(&e)));
                 }
             }
         }
@@ -2506,7 +2555,7 @@ async fn stream_markdown(
             Body::empty(),
         )
             .into_response()),
-        Some(Err(e)) => Err(ApiError::Unsupported(e)),
+        Some(Err(e)) => Err(e),
         Some(Ok((first_chunk, confidence))) => {
             use tokio_stream::StreamExt;
             let rest = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -2514,7 +2563,10 @@ async fn stream_markdown(
                 .chain(rest)
                 .map(|item| {
                     item.map(|(text, _)| text.into_bytes()).map_err(|e| {
-                        std::io::Error::other(format!("conversion failed mid-stream: {e}"))
+                        std::io::Error::other(format!(
+                            "conversion failed mid-stream: {}",
+                            api_error_message(e)
+                        ))
                     })
                 });
             let mut response = (
@@ -2527,6 +2579,17 @@ async fn stream_markdown(
             }
             Ok(response)
         }
+    }
+}
+
+/// The HTTP shape of a conversion failure: a worker that *panicked* is a bug
+/// on this side and answers 500, while every other error is about the document
+/// and answers 422. Without the distinction a panic reached the client as an
+/// empty 200 — the stream simply ended (#395/#396).
+fn conversion_api_error(e: &ConversionError) -> ApiError {
+    match e {
+        ConversionError::Panic(msg) => ApiError::Internal(msg.clone()),
+        other => ApiError::Unsupported(other.to_string()),
     }
 }
 
@@ -2561,6 +2624,33 @@ mod pipeline_flag_tests {
         // needless model reload): the stored flags stay identical, which is
         // the rebuild guard itself.
         assert!(warm_pipeline(&mut slot, &default_opts).is_ok());
+        assert_eq!(slot.as_ref().unwrap().0, PipelineFlags::default());
+    }
+
+    /// #423: the enrichment passes are per-instance state like the model
+    /// switches — a request asking for them rebuilds the warm pipeline with
+    /// the passes enabled, a repeat keeps it, and a plain request afterwards
+    /// rebuilds back so no default caller pays for (or receives) enrichment.
+    #[test]
+    fn enrichment_flags_are_part_of_the_rebuild_guard() {
+        let mut slot = None;
+        let enriched = ConvertOptions {
+            do_picture_classification: Some(true),
+            do_formula_enrichment: Some(true),
+            ..ConvertOptions::default()
+        };
+        assert!(warm_pipeline(&mut slot, &enriched).is_ok());
+        let built = slot.as_ref().unwrap().0;
+        assert!(built.enrich.picture_classification && built.enrich.formula);
+        assert!(!built.enrich.code);
+        assert_ne!(built, PipelineFlags::default());
+        // Explicit `false` and unset mean the same thing: off.
+        let off = ConvertOptions {
+            do_code_enrichment: Some(false),
+            ..ConvertOptions::default()
+        };
+        assert_eq!(PipelineFlags::of(&off), PipelineFlags::default());
+        assert!(warm_pipeline(&mut slot, &off).is_ok());
         assert_eq!(slot.as_ref().unwrap().0, PipelineFlags::default());
     }
 }

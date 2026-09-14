@@ -33,12 +33,13 @@
 //! the way upstream's `RichTableCell` does (a nested `itemize`, a nested
 //! `table`), newlines flattened to spaces.
 //!
-//! Deliberate deviations: upstream *raises* on a section header deeper than
+//! Deliberate deviation: upstream *raises* on a section header deeper than
 //! `\subsubsection`; a conversion should not fail on an `<h5>`, so those
-//! degrade to `\paragraph` / `\subparagraph`. And upstream's serializer emits
-//! the text of a formatted list item or heading *twice* (once inside
-//! `\item` / `\section{}`, then again as the inline group's own paragraph —
-//! docling-core#740); that duplication is not reproduced.
+//! degrade to `\paragraph` / `\subparagraph`. (Until docling-core 2.95 the
+//! upstream serializer also emitted the text of a formatted list item or
+//! heading *twice* — inside `\item` / `\section{}` and again as the inline
+//! group's own paragraph, docling-core#740; that was never reproduced here
+//! and docling-core#743 fixed it upstream, so the outputs agree again.)
 
 use crate::document::{DoclingDocument, FieldItem, Node, Table};
 
@@ -455,6 +456,8 @@ fn render_one(node: &Node, list_level: usize, inline: bool, parts: &mut Vec<Stri
             };
             push(parts, format!("\\{cmd}{{{}}}", inline_md(text)));
         }
+        // A standalone caption item is a text item to the LaTeX serializer.
+        Node::Caption { text, .. } => push(parts, inline_md(text)),
         Node::Paragraph { text } => {
             // A whole-paragraph `$$…$$` is a formula item in the JSON — never
             // escaped, re-wrapped by the serializer.
@@ -502,7 +505,12 @@ fn render_one(node: &Node, list_level: usize, inline: bool, parts: &mut Vec<Stri
         // Upstream's fallback on a group joins its children with blank lines;
         // an `inline` group is docling's InlineGroup, joined with spaces in
         // inline scope.
-        Node::Group { label, children } => {
+        // A group on a non-body content layer (a hidden spreadsheet sheet) is
+        // not rendered, like every other non-body item.
+        Node::Group { layer: Some(_), .. } => {}
+        Node::Group {
+            label, children, ..
+        } => {
             if label == "inline" {
                 push(parts, render_nodes(children, list_level, true).join(" "));
             } else {
@@ -515,7 +523,12 @@ fn render_one(node: &Node, list_level: usize, inline: bool, parts: &mut Vec<Stri
         Node::FieldRegion { items } => render_field_region(items, parts),
         Node::InlineGroup { md_text, .. } => push(parts, inline_md(md_text)),
         Node::TextDump(text) => push(parts, text_item(text)),
-        Node::Located { inner, .. } => render_one(inner, list_level, inline, parts),
+        // Notes-layer comments are omitted; an annotated item renders itself.
+        Node::CommentSection { .. } => {}
+        Node::Commented { inner, .. } => render_one(inner, list_level, inline, parts),
+        Node::Located { inner, .. } | Node::Prov { inner, .. } => {
+            render_one(inner, list_level, inline, parts)
+        }
         // A lone list item outside a run (defensive; `render_nodes` folds
         // every run it sees).
         Node::ListItem { .. } => {
@@ -674,22 +687,16 @@ fn level_of(node: &Node) -> u8 {
 }
 
 /// Split a run of list items into sibling list groups at the base level: a
-/// new group starts on `first_in_list`, a kind flip, or an ordered-number
-/// discontinuity — unless the previous base item was a multilevel projection
-/// continuing the same Word list (docling#3902).
+/// new group starts where the backend flagged one (`first_in_list`), the same
+/// boundary the Markdown and JSON serializers use (#385).
 fn sibling_lists(run: &[Node]) -> Vec<&[Node]> {
     let base = level_of(&run[0]);
     let mut groups = Vec::new();
     let mut seg = 0;
-    let mut prev: Option<(bool, u64)> = None;
-    let mut prev_projected = false;
     for k in 0..run.len() {
         let Node::ListItem {
-            ordered,
-            number,
             first_in_list,
             level,
-            dclx,
             ..
         } = &run[k]
         else {
@@ -698,20 +705,10 @@ fn sibling_lists(run: &[Node]) -> Vec<&[Node]> {
         if *level != base {
             continue;
         }
-        let eff_ordered = dclx.as_ref().map_or(*ordered, |d| d.ordered);
-        if k > seg {
-            if let Some((po, pn)) = prev {
-                let same_word_list = prev_projected && eff_ordered;
-                if *first_in_list
-                    || (!same_word_list && (po != *ordered || (*ordered && *number != pn + 1)))
-                {
-                    groups.push(&run[seg..k]);
-                    seg = k;
-                }
-            }
+        if k > seg && *first_in_list {
+            groups.push(&run[seg..k]);
+            seg = k;
         }
-        prev = Some((*ordered, *number));
-        prev_projected = eff_ordered && !*ordered;
     }
     groups.push(&run[seg..]);
     groups

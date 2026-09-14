@@ -381,18 +381,9 @@ fn render(nodes: &[Node], blocks: &mut Vec<String>, ctx: &mut Ctx) {
 /// docling-core's serializer.
 fn render_list_run(items: &[Node], blocks: &mut Vec<String>, strict: bool) {
     let mut lines: Vec<String> = Vec::new();
-    // Per level, the previous item's (ordered, number) so we can detect a new
-    // sibling list.
-    let mut prev: Vec<Option<(bool, u64)>> = Vec::new();
-    // Whether the previous top-level item was a multilevel projection — an
-    // ordered `1.2.`-style item rendered as a Markdown bullet (docx's DocLang
-    // overlay says ordered, the flat field says bullet). Word numbers such an
-    // item and its parent-level successor within one list (same `numId`), and
-    // docling keeps them in one group — so the kind-flip / number-continuity
-    // breaks below must not fire across it (docling#3902's
-    // docx_list_blank_spacer: `- 1.2. Sub two` directly followed by
-    // `2. Second section`, no blank line).
-    let mut prev_projected = false;
+    // Whether a top-level item has been rendered yet — a fresh-list flag on
+    // the very first item opens nothing.
+    let mut any_top = false;
 
     for item in items {
         let Node::ListItem {
@@ -403,7 +394,7 @@ fn render_list_run(items: &[Node], blocks: &mut Vec<String>, strict: bool) {
             level,
             marker: _,
             location: _,
-            dclx,
+            dclx: _,
             href: _,
             layer,
         } = item
@@ -417,33 +408,19 @@ fn render_list_run(items: &[Node], blocks: &mut Vec<String>, strict: bool) {
         }
         let level = *level as usize;
 
-        // Returning to a shallower level ends the deeper sibling lists.
-        prev.truncate(level + 1);
-        while prev.len() <= level {
-            prev.push(None);
-        }
-
-        // A new sibling list at the same depth gets a blank line: the kind flips
-        // (`<ul>`↔`<ol>`), an ordered run breaks (`1, 2` then `42`), or the
-        // backend flagged a fresh list (e.g. Markdown's bullet changing `-`→`*`).
-        // Only at the top level: nested sibling groups are children of a list
-        // item, and docling joins an item's children without blank lines.
-        let eff_ordered = dclx.as_ref().map_or(*ordered, |d| d.ordered);
+        // A new sibling list at the top level gets a blank line — and only the
+        // backend knows where one starts (`first_in_list`: Word's `numId`
+        // changing, an HTML `<ul>` closing, a Markdown bullet switching
+        // `-`→`*`). The serializer used to guess it from a kind flip or a
+        // number gap as well, which split lists docling keeps whole (an
+        // AsciiDoc `1.` … `5.`, mixed `*`/`1.` markers) — #385. Only at the
+        // top level: nested sibling groups are children of a list item, and
+        // docling joins an item's children without blank lines.
         if level == 0 {
-            if let Some((prev_ordered, prev_number)) = prev[level] {
-                // A projected predecessor suppresses both heuristics for an
-                // ordered successor: the flat kind flip is an artifact of the
-                // bullet projection, and the numbering continues the deeper
-                // sequence (`1.2.` → `2.`), not this level's.
-                let same_word_list = prev_projected && eff_ordered;
-                let new_list = *first_in_list
-                    || (!same_word_list
-                        && (prev_ordered != *ordered || (*ordered && *number != prev_number + 1)));
-                if new_list {
-                    lines.push(String::new());
-                }
+            if any_top && *first_in_list {
+                lines.push(String::new());
             }
-            prev_projected = eff_ordered && !*ordered;
+            any_top = true;
         }
 
         let indent = "    ".repeat(level);
@@ -452,11 +429,7 @@ fn render_list_run(items: &[Node], blocks: &mut Vec<String>, strict: bool) {
         } else {
             "-".to_string()
         };
-        lines.push(format!(
-            "{indent}{marker} {}",
-            md_line_breaks(&strict_text(text, strict))
-        ));
-        prev[level] = Some((*ordered, *number));
+        lines.push(format!("{indent}{marker} {}", list_item_text(text, strict)));
     }
 
     // A run consisting only of furniture (content-layer-filtered) items yields no
@@ -464,6 +437,57 @@ fn render_list_run(items: &[Node], blocks: &mut Vec<String>, strict: bool) {
     if !lines.is_empty() {
         blocks.push(lines.join("\n"));
     }
+}
+
+/// A list item's Markdown body. The GFM hard-line-break rule (docling-core#721)
+/// applies to the item's own text; pictures the HTML backend folded into the
+/// item (`"\n[alt\n]<!-- image -->"` per `<img>` inside the `<li>`) are
+/// docling's picture *children* of the item, which its serializer prints after
+/// the item line with plain newlines — so a folded tail keeps its newlines
+/// unmarked. The tail is recognised structurally: every line after the first is
+/// an image marker or an alt caption directly followed by one.
+fn list_item_text(text: &str, strict: bool) -> String {
+    let escaped = strict_text(text, strict);
+    if let Some((own, tail)) = escaped.split_once('\n') {
+        if is_folded_child_tail(tail) {
+            return format!("{}\n{tail}", md_line_breaks(own));
+        }
+    }
+    md_line_breaks(&escaped)
+}
+
+/// Whether everything after a list item's own first line is a folded *child*
+/// block rather than a continuation of the item's text: an image marker
+/// (optionally preceded by its caption/alt line) or a fenced code block. The
+/// AsciiDoc backend indents such a block to the item's own depth (as
+/// docling-core's list serializer does for each part it emits), so a leading
+/// indent is ignored here.
+fn is_folded_child_tail(tail: &str) -> bool {
+    const MARKER: &str = "<!-- image -->";
+    const FENCE: &str = "```";
+    let mut lines = tail.split('\n').peekable();
+    let mut any = false;
+    while let Some(line) = lines.next() {
+        let line = line.trim_start();
+        if line == MARKER {
+            any = true;
+        } else if line == FENCE {
+            // Skip the block's body; an unclosed fence is not a folded child.
+            loop {
+                match lines.next() {
+                    Some(l) if l.trim_start() == FENCE => break,
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+            any = true;
+        } else if lines.next().map(str::trim_start) == Some(MARKER) {
+            any = true; // an alt caption line, then its marker
+        } else {
+            return false;
+        }
+    }
+    any
 }
 
 fn render_one(node: &Node, blocks: &mut Vec<String>, ctx: &mut Ctx) {
@@ -482,6 +506,16 @@ fn render_one(node: &Node, blocks: &mut Vec<String>, ctx: &mut Ctx) {
         // nothing to Markdown — only DocLang/JSON keep it.
         Node::Paragraph { text } if text.is_empty() => {}
         Node::Paragraph { text } => blocks.push(md_line_breaks(&strict_text(text, ctx.strict))),
+        // A standalone caption item renders like a text item; its hyperlink
+        // annotation becomes a Markdown link around the whole caption.
+        Node::Caption { text, .. } if text.is_empty() => {}
+        Node::Caption { text, href } => {
+            let body = md_line_breaks(&strict_text(text, ctx.strict));
+            blocks.push(match href {
+                Some(url) => format!("[{body}]({url})"),
+                None => body,
+            });
+        }
         Node::CheckboxItem { checked, text } => {
             let mark = if *checked { "- [x] " } else { "- [ ] " };
             blocks.push(md_line_breaks(&strict_text(
@@ -556,6 +590,9 @@ fn render_one(node: &Node, blocks: &mut Vec<String>, ctx: &mut Ctx) {
         }
         // A DocLang-only node is omitted from Markdown.
         Node::DoclangOnly(_) => {}
+        // A group on a non-body layer (a hidden spreadsheet sheet) renders
+        // nothing, like every other non-body item.
+        Node::Group { layer: Some(_), .. } => {}
         Node::Group { children, .. } => render(children, blocks, ctx),
         Node::FieldRegion { items } => {
             // The region container and each field item carry no text of their
@@ -583,8 +620,12 @@ fn render_one(node: &Node, blocks: &mut Vec<String>, ctx: &mut Ctx) {
         // Markdown by default, mirroring docling.
         Node::Furniture { .. } => {}
         Node::PageFurniture { .. } => {}
+        // A comment lives in the notes layer — omitted like other furniture;
+        // the annotation on a body item is JSON-only, so render the item.
+        Node::CommentSection { .. } => {}
+        Node::Commented { inner, .. } => render_one(inner, blocks, ctx),
         // Layout provenance is DocLang-only; render the wrapped node.
-        Node::Located { inner, .. } => render_one(inner, blocks, ctx),
+        Node::Located { inner, .. } | Node::Prov { inner, .. } => render_one(inner, blocks, ctx),
         // Page breaks are DocLang-only; docling omits them from Markdown.
         Node::PageBreak => {}
         // Page markers feed the JSON export only.
@@ -622,11 +663,94 @@ fn picture_marker(image: Option<&crate::PictureImage>, ctx: &mut Ctx) -> String 
             );
             ctx.pic_index += 1;
             ctx.artifacts.push((path.clone(), img.data.clone()));
-            format!("![Image]({path})")
+            format!("![Image]({})", escape_uri_path(&path))
         }
         // Placeholder, or any mode with no extracted image.
         _ => "<!-- image -->".to_string(),
     }
+}
+
+/// Encode a URL or filesystem path as a Markdown link destination —
+/// docling-core's `MarkdownPictureSerializer._escape_uri_path`
+/// (docling-core#698, 2.94). Handles URLs of any scheme as well as POSIX and
+/// Windows paths, keeps relative paths relative and never double-encodes:
+/// backslashes become `/` (a backslash is both the Windows separator and a
+/// Markdown escape), a UNC share `//host/…` and an absolute Windows path
+/// `C:/…` become RFC 8089 `file://` URLs (the one spelling a renderer cannot
+/// misread as a scheme-relative URL or a `C:` scheme), a URL keeps its
+/// scheme / authority / delimiters with only the components encoded, and
+/// everything else is percent-encoded as a path. `%` is kept so an
+/// already-encoded destination stays as it is; spaces and parentheses are
+/// encoded because they would end (or unbalance) a Markdown inline link.
+pub(crate) fn escape_uri_path(value: &str) -> String {
+    const KEEP: &str = "/%:@+,;=~$!&'*";
+    let s = value.replace('\\', "/");
+    if let Some(rest) = s.strip_prefix("//") {
+        // A fileshare: `file://<host>/<path>`, the host possibly empty.
+        let rest = rest.trim_start_matches('/');
+        let (host, tail) = rest.split_once('/').unwrap_or((rest, ""));
+        return format!("file://{host}{}", percent_quote(&format!("/{tail}"), KEEP));
+    }
+    let bytes = s.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        // A Windows path with a drive letter: `file:///C:/…`.
+        return format!("file:///{}", percent_quote(&s, KEEP));
+    }
+    // A URL keeps its scheme, authority and delimiters; only its components are
+    // encoded. A single-character scheme cannot be real (it is a drive letter,
+    // handled above), so it is read as a path — like `urlsplit`.
+    if let Some((scheme, rest)) = s.split_once(':') {
+        let valid_scheme = scheme.len() > 1
+            && scheme.as_bytes()[0].is_ascii_alphabetic()
+            && scheme
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
+        if valid_scheme {
+            let (authority, rest) = match rest.strip_prefix("//") {
+                Some(r) => {
+                    let end = r.find(['/', '?', '#']).unwrap_or(r.len());
+                    (Some(&r[..end]), &r[end..])
+                }
+                None => (None, rest),
+            };
+            let (before_frag, fragment) = rest.split_once('#').unwrap_or((rest, ""));
+            let (path, query) = before_frag.split_once('?').unwrap_or((before_frag, ""));
+            let mut out = format!("{scheme}:");
+            if let Some(a) = authority {
+                out.push_str("//");
+                out.push_str(a);
+            }
+            out.push_str(&percent_quote(path, KEEP));
+            if !query.is_empty() {
+                out.push('?');
+                out.push_str(&percent_quote(query, KEEP));
+            }
+            if !fragment.is_empty() {
+                out.push('#');
+                out.push_str(&percent_quote(fragment, KEEP));
+            }
+            return out;
+        }
+    }
+    // A relative or root-relative local path.
+    percent_quote(&s, KEEP)
+}
+
+/// `urllib.parse.quote(s, safe)`: unreserved ASCII (`A–Z a–z 0–9 _ . - ~`) and
+/// the `safe` set stay, every other byte of the UTF-8 encoding becomes `%XX`.
+fn percent_quote(s: &str, safe: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let keep = b.is_ascii_alphanumeric()
+            || matches!(b, b'_' | b'.' | b'-' | b'~')
+            || (b.is_ascii() && safe.contains(b as char));
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 fn ext_for(mimetype: &str) -> &str {
@@ -652,7 +776,9 @@ fn ext_for(mimetype: &str) -> &str {
 ///   the padded serializer.
 ///
 /// Each cell is first escaped (`\n` → space, `|` → `&#124;`) so it can't break the
-/// table. Row 0 is the header.
+/// table. The header row is the table's leading `column_header` block flattened
+/// to one row ([`Table::header_row_count`] + [`flatten_header_rows`],
+/// docling-core#723); alignment and widths are computed over the body rows.
 /// Whether a table cell counts as a number for column alignment, matching
 /// `tabulate`'s detection: an ordinary float/int (`f64`-parseable, covering
 /// `1e2`/`inf`/`+1.5`) **or** a thousands-separated number like `7,015`.
@@ -708,6 +834,29 @@ fn is_thousands_number(t: &str) -> bool {
     i == b.len()
 }
 
+/// The single GFM header row for a table: the leading header rows (see
+/// [`Table::header_row_count`]) flattened per column, texts joined with
+/// `" - "` after dropping consecutive duplicates — docling-core's
+/// `_flatten_header_rows` (docling-core#723). The duplicate rule is what
+/// keeps a row-spanning header from being joined to itself (the grid repeats
+/// its text into every row it covers); it is position-based, so two stacked
+/// levels sharing a label collapse too — GFM has one header row, and upstream
+/// accepts that loss. No header rows → one empty header cell per column.
+fn flatten_header_rows(header_rows: &[Vec<String>], num_cols: usize) -> Vec<String> {
+    (0..num_cols)
+        .map(|c| {
+            let mut parts: Vec<&str> = Vec::new();
+            for row in header_rows {
+                let text = row.get(c).map(String::as_str).unwrap_or("");
+                if !text.is_empty() && parts.last() != Some(&text) {
+                    parts.push(text);
+                }
+            }
+            parts.join(" - ")
+        })
+        .collect()
+}
+
 pub(crate) fn render_table(table: &Table, compact: bool) -> String {
     if table.rows.is_empty() {
         return String::new();
@@ -717,52 +866,52 @@ pub(crate) fn render_table(table: &Table, compact: bool) -> String {
         return String::new();
     }
 
-    // Escaped, rectangular grid (ragged rows padded with empty cells). `tabulate`
-    // strips data cells of surrounding whitespace but leaves the header row as-is.
-    let grid: Vec<Vec<String>> = table
-        .rows
-        .iter()
-        .enumerate()
-        .map(|(r, row)| {
-            (0..num_cols)
-                .map(|c| {
-                    let cell = escape_cell(row.get(c).map(String::as_str).unwrap_or(""));
-                    if r == 0 {
-                        cell
-                    } else {
-                        cell.trim().to_string()
-                    }
-                })
+    // Escaped, rectangular grid (ragged rows padded with empty cells). The
+    // header block is resolved to the one row GFM allows (docling-core#723);
+    // `tabulate` strips data cells of surrounding whitespace but leaves the
+    // header texts as-is.
+    let num_headers = table.header_row_count().min(table.rows.len());
+    let escaped = |r: usize| -> Vec<String> {
+        (0..num_cols)
+            .map(|c| escape_cell(table.rows[r].get(c).map(String::as_str).unwrap_or("")))
+            .collect()
+    };
+    let header_rows: Vec<Vec<String>> = (0..num_headers).map(escaped).collect();
+    let header = flatten_header_rows(&header_rows, num_cols);
+    let body: Vec<Vec<String>> = (num_headers..table.rows.len())
+        .map(|r| {
+            escaped(r)
+                .into_iter()
+                .map(|c| c.trim().to_string())
                 .collect()
         })
         .collect();
 
     if compact {
         // Compact: cells joined by " | ", no padding, single-dash separators.
-        let render_row = |r: usize| -> String { format!("| {} |", grid[r].join(" | ")) };
-        let mut lines = Vec::with_capacity(grid.len() + 1);
-        lines.push(render_row(0));
+        let render_row = |row: &[String]| -> String { format!("| {} |", row.join(" | ")) };
+        let mut lines = Vec::with_capacity(body.len() + 2);
+        lines.push(render_row(&header));
         let sep: Vec<&str> = (0..num_cols).map(|_| "-").collect();
         lines.push(format!("| {} |", sep.join(" | ")));
-        for r in 1..grid.len() {
-            lines.push(render_row(r));
+        for row in &body {
+            lines.push(render_row(row));
         }
         return lines.join("\n");
     }
 
     // Display width (Unicode scalar count — good enough for now).
     let dw = |s: &str| s.chars().count();
-    let data_rows = 1..grid.len();
 
-    // A column is right-aligned when at least one data cell is numeric and every
-    // non-empty data cell is numeric — matching `tabulate`'s column typing, where
+    // A column is right-aligned when at least one body cell is numeric and every
+    // non-empty body cell is numeric — matching `tabulate`'s column typing, where
     // empty cells are "missing" (ignored) and a number may carry thousands
     // separators (`7,015`), which a plain `f64` parse rejects.
     let right: Vec<bool> = (0..num_cols)
         .map(|c| {
             let mut any = false;
-            for r in data_rows.clone() {
-                let t = grid[r][c].trim();
+            for row in &body {
+                let t = row[c].trim();
                 if t.is_empty() {
                     continue;
                 }
@@ -775,12 +924,12 @@ pub(crate) fn render_table(table: &Table, compact: bool) -> String {
         })
         .collect();
 
-    // Column width = max(header_width + MIN_PADDING(2), max data-cell width).
+    // Column width = max(header_width + MIN_PADDING(2), max body-cell width).
     let width: Vec<usize> = (0..num_cols)
         .map(|c| {
-            let mut w = dw(&grid[0][c]) + 2;
-            for r in data_rows.clone() {
-                w = w.max(dw(&grid[r][c]));
+            let mut w = dw(&header[c]) + 2;
+            for row in &body {
+                w = w.max(dw(&row[c]));
             }
             w
         })
@@ -795,17 +944,17 @@ pub(crate) fn render_table(table: &Table, compact: bool) -> String {
         };
         format!(" {body} ")
     };
-    let render_row = |r: usize| -> String {
-        let cells: Vec<String> = (0..num_cols).map(|c| fmt_cell(&grid[r][c], c)).collect();
+    let render_row = |row: &[String]| -> String {
+        let cells: Vec<String> = (0..num_cols).map(|c| fmt_cell(&row[c], c)).collect();
         format!("|{}|", cells.join("|"))
     };
 
-    let mut lines = Vec::with_capacity(grid.len() + 1);
-    lines.push(render_row(0));
+    let mut lines = Vec::with_capacity(body.len() + 2);
+    lines.push(render_row(&header));
     let sep: Vec<String> = (0..num_cols).map(|c| "-".repeat(width[c] + 2)).collect();
     lines.push(format!("|{}|", sep.join("|")));
-    for r in data_rows {
-        lines.push(render_row(r));
+    for row in &body {
+        lines.push(render_row(row));
     }
     lines.join("\n")
 }
@@ -819,7 +968,61 @@ fn escape_cell(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PictureImage;
+    use crate::{PictureImage, TableCell, TableStructure};
+
+    /// #385: where one list ends and the next begins is the backend's call
+    /// (`first_in_list`), never the serializer's. An ordered run `1.` → `5.`
+    /// is one list (an AsciiDoc numbered list around a nested one), and so are
+    /// mixed bullet/ordered items the backend did not separate; only a flagged
+    /// item opens a new list and earns the blank line.
+    #[test]
+    fn list_boundaries_come_from_the_backend_not_the_numbering() {
+        let item = |ordered: bool, number: u64, first_in_list: bool, text: &str| Node::ListItem {
+            ordered,
+            number,
+            first_in_list,
+            text: text.into(),
+            level: 0,
+            marker: None,
+            location: None,
+            dclx: None,
+            href: None,
+            layer: None,
+        };
+        let md = |items: Vec<Node>| {
+            let mut doc = DoclingDocument::new("t");
+            for n in items {
+                doc.push(n);
+            }
+            doc.export_to_markdown()
+        };
+        // A number gap alone is not a boundary.
+        assert_eq!(
+            md(vec![
+                item(true, 1, true, "one"),
+                item(true, 5, false, "five")
+            ]),
+            "1. one\n5. five\n"
+        );
+        // Nor is a kind flip the backend did not flag …
+        assert_eq!(
+            md(vec![
+                item(false, 0, true, "bullet"),
+                item(true, 1, false, "one"),
+                item(false, 0, false, "bullet two"),
+            ]),
+            "- bullet\n1. one\n- bullet two\n"
+        );
+        // … while a flagged item is one, whatever its number says.
+        assert_eq!(
+            md(vec![
+                item(true, 1, true, "a"),
+                item(true, 2, false, "b"),
+                item(true, 3, true, "new list, continuing count"),
+            ]),
+            "1. a\n2. b\n\n3. new list, continuing count\n"
+        );
+    }
 
     #[test]
     fn renders_headings_paragraphs_and_lists() {
@@ -947,6 +1150,240 @@ mod tests {
         );
     }
 
+    /// docling-core#698: the referenced-image destination is percent-encoded —
+    /// upstream's own case table (paths, Windows flavours, UNC, URLs) plus
+    /// idempotency on the encoded result.
+    #[test]
+    fn referenced_image_destinations_are_escaped() {
+        let cases = [
+            (
+                "doc_artifacts/image_000001_ab12.png",
+                "doc_artifacts/image_000001_ab12.png",
+            ),
+            (
+                "My Report_artifacts/img.png",
+                "My%20Report_artifacts/img.png",
+            ),
+            ("artifacts/img (1).png", "artifacts/img%20%281%29.png"),
+            ("100%_scale/a#b?c.png", "100%_scale/a%23b%3Fc.png"),
+            ("/home/a b/img.png", "/home/a%20b/img.png"),
+            (
+                "My Report_artifacts\\img.png",
+                "My%20Report_artifacts/img.png",
+            ),
+            (
+                "C:/Users/me/My Docs/img.png",
+                "file:///C:/Users/me/My%20Docs/img.png",
+            ),
+            ("C:\\Users\\me\\img.png", "file:///C:/Users/me/img.png"),
+            (
+                "//server/share/My Docs/img.png",
+                "file://server/share/My%20Docs/img.png",
+            ),
+            ("\\\\server\\share\\img.png", "file://server/share/img.png"),
+            ("file:///home/a b/img.png", "file:///home/a%20b/img.png"),
+            (
+                "s3://bucket/My Report_artifacts/img.png",
+                "s3://bucket/My%20Report_artifacts/img.png",
+            ),
+            (
+                "https://example.com:8080/a b.png?w=1&h=2#frag",
+                "https://example.com:8080/a%20b.png?w=1&h=2#frag",
+            ),
+            (
+                "https://example.com/img (1).png",
+                "https://example.com/img%20%281%29.png",
+            ),
+            ("caf\u{e9}/im\u{e4}ge.png", "caf%C3%A9/im%C3%A4ge.png"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(escape_uri_path(input), expected, "input {input:?}");
+            assert_eq!(
+                escape_uri_path(expected),
+                expected,
+                "idempotent {expected:?}"
+            );
+        }
+        // The whole marker, through the referenced-image export.
+        let mut doc = DoclingDocument::new("t");
+        doc.push(Node::Picture {
+            caption: None,
+            caption_href: None,
+            image: Some(PictureImage {
+                mimetype: "image/png".into(),
+                width: 1,
+                height: 1,
+                data: b"x".to_vec(),
+            }),
+            classification: None,
+            caption_parent: Default::default(),
+        });
+        let (md, files) = doc
+            .export_to_markdown_with_images(ImageMode::Referenced, "My Report (final)_artifacts");
+        assert!(
+            md.contains("![Image](My%20Report%20%28final%29_artifacts/image_000000.png)"),
+            "got:\n{md}"
+        );
+        // The file path handed back for writing stays unescaped.
+        assert_eq!(files[0].0, "My Report (final)_artifacts/image_000000.png");
+    }
+
+    /// Pictures the HTML backend folds into a list item print after the item
+    /// line with plain newlines; a `<br>` newline in the item's own text is
+    /// still a GFM hard line break.
+    #[test]
+    fn folded_list_item_pictures_keep_plain_newlines() {
+        assert_eq!(
+            list_item_text("Step\n<!-- image -->", false),
+            "Step\n<!-- image -->"
+        );
+        assert_eq!(
+            list_item_text("Step\nAlt text\n<!-- image -->\n<!-- image -->", false),
+            "Step\nAlt text\n<!-- image -->\n<!-- image -->"
+        );
+        assert_eq!(
+            list_item_text("line one\nline two", false),
+            "line one  \nline two"
+        );
+    }
+
+    /// docling-core#723: the header block is the leading run of rows on which a
+    /// `column_header` cell starts, flattened per column with " - ".
+    #[test]
+    fn stacked_header_rows_flatten_into_one() {
+        let mut t = Table {
+            rows: vec![
+                vec!["".into(), "% of Total".into(), "% of Total".into()],
+                vec!["class".into(), "Train".into(), "Test".into()],
+                vec!["Caption".into(), "2.04".into(), "1.77".into()],
+            ],
+            ..Default::default()
+        };
+        t.structure = Some(TableStructure {
+            header_row: vec![true, true, false],
+            col_continuation: vec![
+                vec![false, false, true],
+                vec![false, false, false],
+                vec![false, false, false],
+            ],
+            ..Default::default()
+        });
+        assert_eq!(t.header_row_count(), 2);
+        assert_eq!(
+            render_table(&t, true),
+            "| class | % of Total - Train | % of Total - Test |\n| - | - | - |\n| Caption | 2.04 | 1.77 |"
+        );
+        // padded: widths from the flattened header, alignment from body rows
+        assert_eq!(
+            render_table(&t, false),
+            "| class   |   % of Total - Train |   % of Total - Test |\n\
+             |---------|----------------------|---------------------|\n\
+             | Caption |                 2.04 |                1.77 |"
+        );
+    }
+
+    /// A header spanning two rows is repeated into the second row by the grid;
+    /// that row is not a header row unless another header cell starts there.
+    #[test]
+    fn vertically_spanning_header_does_not_extend_the_block() {
+        let mut t = Table {
+            rows: vec![
+                vec!["Name".into(), "Value".into()],
+                vec!["Name".into(), "1".into()],
+                vec!["x".into(), "2".into()],
+            ],
+            ..Default::default()
+        };
+        t.structure = Some(TableStructure {
+            col_header: vec![vec![true, true], vec![true, false], vec![false, false]],
+            row_continuation: vec![vec![false, false], vec![true, false], vec![false, false]],
+            ..Default::default()
+        });
+        assert_eq!(t.header_row_count(), 1);
+        assert_eq!(
+            render_table(&t, true),
+            "| Name | Value |\n| - | - |\n| Name | 1 |\n| x | 2 |"
+        );
+    }
+
+    /// Flags that begin on a later row promote nothing: every row stays in the
+    /// body under an empty header row (tabulate's `headers=["", ""]`).
+    #[test]
+    fn header_flags_not_on_row_zero_keep_all_rows_in_the_body() {
+        let mut t = Table {
+            rows: vec![
+                vec!["1".into(), "2".into()],
+                vec!["a".into(), "b".into()],
+                vec!["333".into(), "4".into()],
+            ],
+            ..Default::default()
+        };
+        t.structure = Some(TableStructure {
+            header_row: vec![false, true, false],
+            ..Default::default()
+        });
+        assert_eq!(t.header_row_count(), 0);
+        assert_eq!(
+            render_table(&t, false),
+            "|     |    |\n|-----|----|\n| 1   | 2  |\n| a   | b  |\n| 333 | 4  |"
+        );
+    }
+
+    /// A pivot table's row headers (`<th rowspan>`) carry `row_header`, not
+    /// `column_header` (docling#4216), so the data row beside them is not
+    /// pulled into the header block — what this port used to reach with a
+    /// deviation now falls out of the flags themselves.
+    #[test]
+    fn pivot_row_headers_do_not_extend_the_header() {
+        let mut t = Table {
+            rows: vec![
+                vec!["Year".into(), "Month".into()],
+                vec!["2025".into(), "January".into()],
+                vec!["2025".into(), "February".into()],
+            ],
+            ..Default::default()
+        };
+        t.structure = Some(TableStructure {
+            col_header: vec![vec![true, true], vec![false, false], vec![false, false]],
+            row_header: vec![vec![false, false], vec![true, false], vec![true, false]],
+            row_continuation: vec![vec![false, false], vec![false, false], vec![true, false]],
+            ..Default::default()
+        });
+        assert_eq!(t.header_row_count(), 1);
+        assert_eq!(
+            render_table(&t, true),
+            "| Year | Month |\n| - | - |\n| 2025 | January |\n| 2025 | February |"
+        );
+    }
+
+    /// No `column_header` anywhere (first-class cells without flags) → row 0
+    /// stays the header, as before.
+    #[test]
+    fn unflagged_cells_keep_row_zero_as_header() {
+        let mut t = Table {
+            rows: vec![vec!["h".into()], vec!["d".into()]],
+            ..Default::default()
+        };
+        t.cells = Some(
+            [(0usize, "h"), (1, "d")]
+                .into_iter()
+                .map(|(r, text)| TableCell {
+                    text: text.into(),
+                    bbox: None,
+                    start_row: r,
+                    start_col: 0,
+                    row_span: 1,
+                    col_span: 1,
+                    column_header: false,
+                    row_header: false,
+                    row_section: false,
+                })
+                .collect(),
+        );
+        assert_eq!(t.header_row_count(), 1);
+        assert_eq!(render_table(&t, true), "| h |\n| - |\n| d |");
+    }
+
     #[test]
     fn renders_compact_table() {
         let mut doc = DoclingDocument::new("t");
@@ -960,6 +1397,7 @@ mod tests {
             cell_blocks: None,
             cells: None,
             caption: None,
+            caption_parent: Default::default(),
         }));
         let md = doc.export_to_markdown();
         assert_eq!(md, "| a | b |\n| - | - |\n| 1 | 2 |\n");
@@ -975,6 +1413,7 @@ mod tests {
             cell_blocks: None,
             cells: None,
             caption: None,
+            caption_parent: Default::default(),
         }));
         let md = doc.export_to_markdown();
         // Numeric data columns are right-aligned; columns padded to header+2.
@@ -1094,6 +1533,7 @@ mod tests {
             cell_blocks: None,
             cells: None,
             caption: None,
+            caption_parent: Default::default(),
         }));
         doc.push(Node::Picture {
             caption: Some("Fig 1".into()),
@@ -1105,6 +1545,7 @@ mod tests {
                 data: b"png-one".to_vec(),
             }),
             classification: None,
+            caption_parent: Default::default(),
         });
         doc.add_paragraph("Last paragraph.");
         // A second embedded picture, so referenced mode must keep numbering
@@ -1119,6 +1560,7 @@ mod tests {
                 data: b"png-two".to_vec(),
             }),
             classification: None,
+            caption_parent: Default::default(),
         });
 
         // A run of list items must never straddle a split, so try splits that fall

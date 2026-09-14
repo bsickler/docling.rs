@@ -78,8 +78,37 @@ impl DeclarativeBackend for DocxBackend {
             return Ok(doc);
         };
         let mut state = ListState::default();
+        // Reviewer comments, by docx `w:id` in `word/comments.xml` order — the
+        // order they become `comment_section` groups below, which is the order
+        // `Node::Commented` indices refer to.
+        let comments = parse_comments(&mut pkg);
+        let comment_slot: HashMap<&str, usize> = comments
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (id.as_str(), i))
+            .collect();
+        // Comment ranges opened by an earlier block and not yet closed: a
+        // `w:commentRangeStart`/`End` pair may span paragraphs, and every
+        // paragraph inside the range is annotated.
+        let mut open: Vec<&str> = Vec::new();
         for node in body.children().filter(XmlNode::is_element) {
+            let slots = block_comment_slots(node, &comment_slot, &mut open);
+            let start = doc.nodes.len();
             process_block(node, &ctx, &mut state, &mut doc);
+            if !slots.is_empty() {
+                for item in doc.nodes[start..].iter_mut() {
+                    let inner = std::mem::replace(
+                        item,
+                        Node::Paragraph {
+                            text: String::new(),
+                        },
+                    );
+                    *item = Node::Commented {
+                        comments: slots.clone(),
+                        inner: Box::new(inner),
+                    };
+                }
+            }
         }
         // Section headers/footers follow the body as furniture-layer content
         // (docling's `_add_header_footer`): the first section always
@@ -87,13 +116,18 @@ impl DeclarativeBackend for DocxBackend {
         // page (`<w:titlePg/>`), which also switches both to the first-page
         // parts.
         add_header_footer(&mut pkg, body, &ctx, &mut doc);
-        // Reviewer comments (docling's `notes` layer) are appended after the body
-        // as furniture text; Markdown/JSON drop them, DocLang emits `<layer
-        // value="notes"/>` items.
-        for comment in parse_comments(&mut pkg) {
-            doc.nodes.push(Node::Furniture {
-                layer: docling_core::ContentLayer::Notes,
-                inner: Box::new(Node::Paragraph { text: comment }),
+        // Reviewer comments (docling's `notes` layer) are appended after the
+        // body as `comment_section` groups: Markdown/LaTeX drop them, JSON
+        // emits the group plus its notes text (and the `comments` back-refs on
+        // the annotated items), DocLang the flat `<layer value="notes"/>` item.
+        for (id, text) in comments {
+            doc.nodes.push(Node::CommentSection {
+                name: format!("comment-{id}"),
+                text,
+                // The docx backend replaces `add_comment`'s text ref with the
+                // group's, so replies to one comment group together.
+                refs_note_text: false,
+                grouped: true,
             });
         }
         Ok(doc)
@@ -217,10 +251,10 @@ fn emit_header_footer_part(pkg: &mut Package, part: &str, ctx: &Ctx, doc: &mut D
     }
 }
 
-/// Parse `word/comments.xml` into docling's per-comment note strings:
-/// `[author: {author} ({initials}), time: {iso}]: {text}` (the author/initials
-/// parts drop out when absent). Empty when the part is missing.
-fn parse_comments(pkg: &mut Package) -> Vec<String> {
+/// Parse `word/comments.xml` into `(w:id, note)` pairs, the note being
+/// docling's `[author: {author} ({initials}), time: {iso}]: {text}` (the
+/// author/initials parts drop out when absent). Empty when the part is missing.
+fn parse_comments(pkg: &mut Package) -> Vec<(String, String)> {
     let Some(xml) = pkg.read("word/comments.xml") else {
         return Vec::new();
     };
@@ -232,11 +266,7 @@ fn parse_comments(pkg: &mut Package) -> Vec<String> {
         let author = attr(c, "author").unwrap_or("").trim();
         let initials = attr(c, "initials").unwrap_or("").trim();
         let date = attr(c, "date").map(format_comment_date).unwrap_or_default();
-        let text: String = c
-            .descendants()
-            .filter(|n| n.has_tag_name("t"))
-            .filter_map(|n| n.text())
-            .collect();
+        let text: String = c.descendants().filter_map(flat_text).collect();
         let head = if author.is_empty() {
             format!("[time: {date}]")
         } else if initials.is_empty() {
@@ -244,9 +274,52 @@ fn parse_comments(pkg: &mut Package) -> Vec<String> {
         } else {
             format!("[author: {author} ({initials}), time: {date}]")
         };
-        out.push(format!("{head}: {text}"));
+        let id = attr(c, "id").unwrap_or("").to_string();
+        out.push((id, format!("{head}: {text}")));
     }
     out
+}
+
+/// The comment slots a body block is annotated by, in `comments.xml` order.
+/// A block carries a comment when it opens one (`w:commentRangeStart`),
+/// anchors one (`w:commentReference` — Word's single-run case, which needs no
+/// range), or sits inside a range opened by an earlier block. `open` carries
+/// that cross-block state and is updated for the ranges this block ends.
+fn block_comment_slots<'a>(
+    node: XmlNode<'a, 'a>,
+    slot_of: &HashMap<&str, usize>,
+    open: &mut Vec<&'a str>,
+) -> Vec<usize> {
+    let ids_with = |tag: &str| -> Vec<&'a str> {
+        node.descendants()
+            .filter(|n| n.has_tag_name(tag))
+            .filter_map(|n| attr(n, "id"))
+            .collect()
+    };
+    let started = ids_with("commentRangeStart");
+    let ended = ids_with("commentRangeEnd");
+    let referenced = ids_with("commentReference");
+
+    let mut ids: Vec<&str> = open.clone();
+    for id in started.iter().chain(referenced.iter()) {
+        if !ids.contains(id) {
+            ids.push(id);
+        }
+    }
+    for id in started {
+        if !ended.contains(&id) && !open.contains(&id) {
+            open.push(id);
+        }
+    }
+    open.retain(|id| !ended.contains(id));
+
+    let mut slots: Vec<usize> = ids
+        .iter()
+        .filter_map(|id| slot_of.get(id).copied())
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    slots
 }
 
 /// OOXML comment dates use e.g. `2026-01-04T05:48:07Z`; docling normalizes them
@@ -267,10 +340,12 @@ fn format_comment_date(raw: &str) -> String {
 
 struct Ctx<'a> {
     style_names: &'a HashMap<String, String>,
-    style_nums: &'a HashMap<String, (String, i64)>, // styleId -> (numId, ilvl)
-    style_based: &'a HashMap<String, String>,       // styleId -> basedOn styleId
-    style_fonts: &'a HashMap<String, String>,       // styleId -> lowercased ascii font
-    style_outline: &'a HashMap<String, u8>,         // styleId -> 1-indexed outlineLvl
+    /// styleId -> the style's *own* `numPr` parts (`numId`, `ilvl`), each
+    /// optional — resolved through `basedOn` by [`style_numbering`].
+    style_nums: &'a HashMap<String, (Option<String>, Option<i64>)>,
+    style_based: &'a HashMap<String, String>, // styleId -> basedOn styleId
+    style_fonts: &'a HashMap<String, String>, // styleId -> lowercased ascii font
+    style_outline: &'a HashMap<String, u8>,   // styleId -> 1-indexed outlineLvl
     num_levels: &'a HashMap<(String, i64), NumLevel>, // (numId, ilvl) -> level props
     rels: &'a HashMap<String, String>,
     images: &'a HashMap<String, PictureImage>, // image relationship id -> extracted image
@@ -285,6 +360,13 @@ struct ListState {
     counters: HashMap<(String, i64), i64>, // (numId, ilvl) -> running number
     numbered_headers: HashMap<u8, u64>,    // heading level -> running number
     list_run_base: Option<i64>,            // base ilvl of the current contiguous list run
+    /// The `numId` of the last list item emitted, while docling would still
+    /// reuse its ListGroup: cleared by any non-empty body block (its
+    /// `_end_list_on_body_text` / a parent change), kept across an empty
+    /// spacer paragraph. A list item whose `numId` differs — or that follows
+    /// such a block — opens a new list (`_manage_list_structure`'s "new list
+    /// sequence"), which is what the item's `first_in_list` flags (#385).
+    last_list_num_id: Option<String>,
     /// Whether a heading/title was emitted before the current paragraph. In
     /// docling's tree later content is parented under that heading `TextItem`,
     /// and the DocLang serializer leaves an InlineGroup whose parent is a
@@ -304,23 +386,19 @@ fn process_block(node: XmlNode, ctx: &Ctx, state: &mut ListState, doc: &mut Docl
             let rows: Vec<XmlNode> = node.children().filter(|n| n.has_tag_name("tr")).collect();
             let num_cols = rows
                 .iter()
-                .map(|r| {
-                    r.children()
-                        .filter(|n| n.has_tag_name("tc"))
-                        .map(grid_span)
-                        .sum::<usize>()
-                })
+                .map(|r| row_cells(*r).into_iter().map(grid_span).sum::<usize>())
                 .max()
                 .unwrap_or(0);
             if rows.len() == 1 && num_cols == 1 {
-                if let Some(cell) = rows[0].children().find(|n| n.has_tag_name("tc")) {
-                    for child in child_elements(cell) {
+                if let Some(cell) = row_cells(rows[0]).first() {
+                    for child in child_elements(*cell) {
                         process_block(child, ctx, state, doc);
                     }
                 }
             } else if let Some(table) = parse_table(node, ctx) {
                 doc.push(Node::Table(table));
                 state.list_run_base = None;
+                state.last_list_num_id = None;
             }
         }
         "sdt" => {
@@ -403,6 +481,7 @@ fn handle_paragraph_inner(
                         caption_href: None,
                         image,
                         classification: None,
+                        caption_parent: Default::default(),
                     });
                 }
             }
@@ -423,6 +502,7 @@ fn handle_paragraph_inner(
             caption_href: None,
             image,
             classification: None,
+            caption_parent: Default::default(),
         });
     }
     // Native charts anchored in this paragraph (docling PR #3809): classified
@@ -458,6 +538,7 @@ fn handle_paragraph_inner(
             }
         }
         state.list_run_base = None;
+        state.last_list_num_id = None;
         return;
     }
 
@@ -472,6 +553,7 @@ fn handle_paragraph_inner(
         let text = clean_checkbox_symbols(&paragraph_markdown(p, ctx));
         doc.push(Node::CheckboxItem { checked, text });
         state.list_run_base = None;
+        state.last_list_num_id = None;
         return;
     }
 
@@ -486,7 +568,7 @@ fn handle_paragraph_inner(
     let numbering = if p.descendants().any(|n| n.has_tag_name("numPr")) {
         num_pr(p)
     } else {
-        ctx.style_nums.get(style_id).cloned()
+        style_numbering(style_id, ctx)
     };
 
     // A heading style wins over a list: a numbered heading gets a computed
@@ -536,6 +618,7 @@ fn handle_paragraph_inner(
             state.seen_heading = true;
         }
         state.list_run_base = None;
+        state.last_list_num_id = None;
         return;
     }
 
@@ -545,6 +628,7 @@ fn handle_paragraph_inner(
     let prev_is_code = matches!(doc.nodes.last(), Some(Node::Code { .. }));
     if !rich && (is_code_style(style_id, ctx) || is_code_by_font(p, style_id, ctx, prev_is_code)) {
         state.list_run_base = None;
+        state.last_list_num_id = None;
         // Keep leading indentation (code blocks are verbatim); trailing space
         // is dropped, matching docling's `raw_paragraph_text.rstrip()`.
         let code_text = plain_paragraph_text(p).trim_end().to_string();
@@ -581,6 +665,12 @@ fn handle_paragraph_inner(
         if text.is_empty() {
             return;
         }
+        // Word's list identity is the `numId`: the item continues the last
+        // list when it carries the same one and no body content intervened;
+        // anything else is a new list, so the serializers never have to infer
+        // the boundary from the numbering (#385).
+        let first_in_list = state.last_list_num_id.as_deref() != Some(num_id.as_str());
+        state.last_list_num_id = Some(num_id.clone());
         if numbered {
             get_list_counter(&mut state.counters, ctx.num_levels, &num_id, ilvl);
             let marker = build_enum_marker(&state.counters, ctx.num_levels, &num_id, ilvl);
@@ -599,7 +689,7 @@ fn handle_paragraph_inner(
                 doc.push(Node::ListItem {
                     ordered: true,
                     number,
-                    first_in_list: false,
+                    first_in_list,
                     text,
                     level,
                     // docling's DOCX backend passes the enumeration marker.
@@ -622,7 +712,7 @@ fn handle_paragraph_inner(
                 doc.push(Node::ListItem {
                     ordered: false,
                     number,
-                    first_in_list: false,
+                    first_in_list,
                     text: format!("{marker} {text}"),
                     level,
                     marker: None,
@@ -666,7 +756,7 @@ fn handle_paragraph_inner(
             doc.push(Node::ListItem {
                 ordered: false,
                 number: 0,
-                first_in_list: false,
+                first_in_list,
                 text,
                 level,
                 marker: None,
@@ -679,8 +769,13 @@ fn handle_paragraph_inner(
         return;
     }
 
-    // A plain (non-list) paragraph ends the current list run.
+    // A plain (non-list) paragraph ends the current list run. Body *text*
+    // also ends the list's identity; an empty spacer paragraph does not, so
+    // the same Word list resumes after it as one list (docling#3902).
     state.list_run_base = None;
+    if !text.is_empty() {
+        state.last_list_num_id = None;
+    }
 
     if !text.is_empty() {
         if has_equations {
@@ -946,6 +1041,62 @@ fn heading_label_level(label: &str) -> Option<u8> {
     }
 }
 
+/// The raw `numPr` parts of a style definition: its own `numId` and `ilvl`
+/// values, each optional (a stock `heading 2` carries only `ilvl`). `None`
+/// when the style has no `numPr` at all.
+fn num_pr_parts(style: XmlNode) -> Option<(Option<String>, Option<i64>)> {
+    let num_pr = style.descendants().find(|n| n.has_tag_name("numPr"))?;
+    let num_id = num_pr
+        .children()
+        .find(|n| n.has_tag_name("numId"))
+        .and_then(|n| attr(n, "val"))
+        .map(str::to_string);
+    let ilvl = num_pr
+        .children()
+        .find(|n| n.has_tag_name("ilvl"))
+        .and_then(|n| attr(n, "val"))
+        .and_then(|v| v.parse().ok());
+    Some((num_id, ilvl))
+}
+
+/// A style's `(numId, ilvl)` resolved through its `basedOn` chain — docling's
+/// `_style_numbering` (docling#3917). Word inherits numbering through the
+/// style hierarchy, and `numId` and `ilvl` inherit *independently*: Word's
+/// stock `heading 2` carries only `ilvl` and takes `numId` from `heading 1`,
+/// so reading one style element left it unnumbered while its siblings at
+/// other levels were numbered. The walk stops once both parts are known or
+/// after ten ancestors (a malformed/cyclic chain); a `numId` of 0 found on
+/// the way means "no list", like a paragraph's own `numId` 0; `ilvl`
+/// defaults to 0 when only `numId` was found.
+fn style_numbering(style_id: &str, ctx: &Ctx) -> Option<(String, i64)> {
+    let (mut num_id, mut ilvl): (Option<String>, Option<i64>) = (None, None);
+    let mut cur = Some(style_id.to_string());
+    let mut depth = 0;
+    while let Some(id) = cur {
+        if depth >= MAX_STYLE_INHERITANCE_DEPTH {
+            break;
+        }
+        if let Some((n, l)) = ctx.style_nums.get(&id) {
+            if num_id.is_none() {
+                num_id = n.clone();
+            }
+            if ilvl.is_none() {
+                ilvl = *l;
+            }
+        }
+        if num_id.is_some() && ilvl.is_some() {
+            break;
+        }
+        cur = ctx.style_based.get(&id).cloned();
+        depth += 1;
+    }
+    let num_id = num_id?;
+    if num_id == "0" {
+        return None;
+    }
+    Some((num_id, ilvl.unwrap_or(0)))
+}
+
 /// `(numId, ilvl)` for an element carrying explicit list numbering. A `numId`
 /// of 0 means "no list" in OOXML and yields `None`.
 fn num_pr(p: XmlNode) -> Option<(String, i64)> {
@@ -1020,7 +1171,16 @@ fn run_groups(runs: Vec<(String, Fmt, Option<String>)>) -> Vec<(String, Fmt, Opt
         group_text.push_str(&text);
     }
     if !group_text.trim().is_empty() {
-        groups.push((group_text.trim().to_string(), last_format, None));
+        // The trailing group closes under the format that *opened* it, as in
+        // docling — a whitespace-only run never opens a group (its text is
+        // just appended), so it must not decide the group's format either.
+        // Taking the last run's format instead lost the bold/italic of a
+        // paragraph that ends with an unformatted space (#408).
+        groups.push((
+            group_text.trim().to_string(),
+            previous_format.unwrap_or(last_format),
+            None,
+        ));
     }
     groups
 }
@@ -1069,11 +1229,8 @@ fn collect_equation_parts(p: XmlNode) -> Vec<EqPart> {
                     parts.push(EqPart::Eq(eq));
                 }
             } else {
-                for t in child
-                    .descendants()
-                    .filter(|n| n.has_tag_name("t") && !in_math(*n))
-                {
-                    if let Some(txt) = t.text() {
+                for t in child.descendants().filter(|n| !in_math(*n)) {
+                    if let Some(txt) = flat_text(t) {
                         parts.push(EqPart::Text(txt.to_string()));
                     }
                 }
@@ -1081,8 +1238,8 @@ fn collect_equation_parts(p: XmlNode) -> Vec<EqPart> {
         }
     } else {
         for node in p.descendants() {
-            if node.has_tag_name("t") && !in_math(node) {
-                if let Some(txt) = node.text() {
+            if !in_math(node) {
+                if let Some(txt) = flat_text(node) {
                     parts.push(EqPart::Text(txt.to_string()));
                 }
             } else if node.has_tag_name("oMath") {
@@ -1203,7 +1360,7 @@ fn inline_equation_runs(parts: &[EqPart]) -> Vec<InlineRun> {
     runs
 }
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Fmt {
     bold: bool,
     italic: bool,
@@ -1264,14 +1421,7 @@ fn collect_one(
             let run_fmt = run_format(child, fmt);
             // A run interleaves text (`<w:t>`) and line breaks (`<w:br>`/`<w:cr>`,
             // rendered as newlines that stay in the paragraph block).
-            let text: String = child_elements(child)
-                .map(|n| match n.tag_name().name() {
-                    "t" => n.text().unwrap_or("").to_string(),
-                    "br" | "cr" => "\n".to_string(),
-                    "tab" => "\t".to_string(),
-                    _ => String::new(),
-                })
-                .collect();
+            let text: String = child_elements(child).map(run_child_text).collect();
             if !text.is_empty() {
                 out.push((text, run_fmt, link.map(str::to_string)));
             }
@@ -1357,12 +1507,7 @@ fn parse_table_with(tbl: XmlNode, ctx: &Ctx, nested: bool) -> Option<Table> {
         .iter()
         .map(|r| {
             let (before, after) = row_grid_offsets(*r);
-            before
-                + after
-                + r.children()
-                    .filter(|n| n.has_tag_name("tc"))
-                    .map(|tc| grid_span(tc))
-                    .sum::<usize>()
+            before + after + row_cells(*r).into_iter().map(grid_span).sum::<usize>()
         })
         .max()
         .unwrap_or(0);
@@ -1389,7 +1534,7 @@ fn parse_table_with(tbl: XmlNode, ctx: &Ctx, nested: bool) -> Option<Table> {
         // fixed in docling PR #3745: cells dropped and merges broken on
         // late-starting rows).
         let mut ci = row_grid_offsets(*row).0;
-        for tc in row.children().filter(|n| n.has_tag_name("tc")) {
+        for tc in row_cells(*row) {
             let span = grid_span(tc);
             // A continuation cell of a vertical merge repeats the cell above.
             let v_continue = tc
@@ -1458,6 +1603,7 @@ fn parse_table_with(tbl: XmlNode, ctx: &Ctx, nested: bool) -> Option<Table> {
         cell_blocks: any_rich.then_some(blocks),
         cells: None,
         caption: None,
+        caption_parent: Default::default(),
     })
 }
 
@@ -1467,6 +1613,63 @@ fn grid_span(tc: XmlNode) -> usize {
         .and_then(|n| attr(n, "val"))
         .and_then(|v| v.parse().ok())
         .unwrap_or(1)
+}
+
+/// The plain text of one child of a `w:r`, python-docx's `CT_R.text` — which
+/// is where docling's paragraph text comes from, so this is the parity target.
+/// Anything not in its `w:br | w:cr | w:noBreakHyphen | w:ptab | w:t | w:tab`
+/// set contributes nothing.
+fn run_child_text(n: XmlNode) -> String {
+    match n.tag_name().name() {
+        "t" => n.text().unwrap_or("").to_string(),
+        // A *line* break is a newline; a page or column break has no text
+        // equivalent at all.
+        "br" => match attr(n, "type") {
+            None | Some("textWrapping") => "\n".to_string(),
+            Some(_) => String::new(),
+        },
+        "cr" => "\n".to_string(),
+        // A hyphen Word marked as ineligible for a line wrap is still a hyphen
+        // (#400): dropping it glued `In` and `Transit` into `InTransit`.
+        "noBreakHyphen" => "-".to_string(),
+        "tab" | "ptab" => "\t".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// The plain text of a run inner-content element, for the places that flatten
+/// a subtree with `descendants()` rather than walking a run's own children.
+/// Only `w:t` and `w:noBreakHyphen` are safe to pick up that way — `w:tab` and
+/// `w:br` also appear in paragraph *properties* (`w:pPr/w:tabs/w:tab`), which
+/// carry no text; `collect_run_tuples` handles those from the run itself.
+fn flat_text<'a, 'i>(n: XmlNode<'a, 'i>) -> Option<&'a str> {
+    match n.tag_name().name() {
+        "t" => Some(n.text().unwrap_or("")),
+        "noBreakHyphen" => Some("-"),
+        _ => None,
+    }
+}
+
+/// A row's `w:tc` cells in document order, unwrapping any content control
+/// (`w:sdt` → `w:sdtContent`) Word wrapped a cell in — its cover pages and
+/// document-property fields are written that way, and the cell is then no
+/// longer a direct child of the `w:tr` (docling#3946/#3951). Controls nest, so
+/// the walk recurses. Without this a wrapped cell is skipped entirely: the
+/// grid cursor advances only per emitted cell, so every later cell in the row
+/// slides left under the wrong header, and a 1×1 layout table loses its only
+/// cell — and with it all of its content.
+fn row_cells<'a, 'i>(tr: XmlNode<'a, 'i>) -> Vec<XmlNode<'a, 'i>> {
+    let mut out = Vec::new();
+    for child in tr.children().filter(XmlNode::is_element) {
+        if child.has_tag_name("tc") {
+            out.push(child);
+        } else if child.has_tag_name("sdt") {
+            if let Some(content) = child.children().find(|n| n.has_tag_name("sdtContent")) {
+                out.extend(row_cells(content));
+            }
+        }
+    }
+    out
 }
 
 /// A row's skipped grid columns: `(w:gridBefore, w:gridAfter)` from its
@@ -1606,15 +1809,14 @@ fn omaths_of<'a, 'i>(child: XmlNode<'a, 'i>) -> Vec<XmlNode<'a, 'i>> {
 }
 
 /// A paragraph's plain run text and equations (`$…$`) in document order, no
-/// formatting markers.
+/// formatting markers — python-docx's `Paragraph.text`, which is where
+/// docling's code text (`raw_paragraph_text`) and plain-cell text come from.
 fn plain_paragraph_text(p: XmlNode) -> String {
     let mut out = String::new();
     for child in child_elements(p) {
         let omaths = omaths_of(child);
         if omaths.is_empty() {
-            for t in child.descendants().filter(|n| n.has_tag_name("t")) {
-                out.push_str(t.text().unwrap_or(""));
-            }
+            push_inline_text(child, &mut out);
         } else {
             for m in omaths {
                 let eq = crate::backend::omml::to_latex(m);
@@ -1627,6 +1829,35 @@ fn plain_paragraph_text(p: XmlNode) -> String {
         }
     }
     out
+}
+
+/// Append the plain text of one paragraph child the way python-docx's
+/// `CT_P.text` / docling's `_iter_paragraph_content` read it: a run's inner
+/// content through [`run_child_text`] (so a `<w:br/>` is a newline and a tab a
+/// tab — flattening the subtree to `w:t` alone glued the lines of a code
+/// paragraph together, #409), a hyperlink's runs likewise, a content control's
+/// `w:t` text only (docling's `.//w:sdtContent//w:t` xpath), and the
+/// transparent wrappers recursed into. Anything else contributes nothing.
+fn push_inline_text(node: XmlNode, out: &mut String) {
+    match node.tag_name().name() {
+        "r" => out.extend(child_elements(node).map(run_child_text)),
+        "hyperlink" => {
+            for r in node.children().filter(|n| n.has_tag_name("r")) {
+                out.extend(child_elements(r).map(run_child_text));
+            }
+        }
+        "sdt" => {
+            for t in node.descendants().filter(|n| n.has_tag_name("t")) {
+                out.push_str(t.text().unwrap_or(""));
+            }
+        }
+        "smartTag" | "customXml" | "ins" | "fldSimple" => {
+            for c in child_elements(node) {
+                push_inline_text(c, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Case-folded paragraph *style names* that mark a paragraph as code (docling PR
@@ -1797,11 +2028,7 @@ fn is_code_by_font(p: XmlNode, style_id: &str, ctx: &Ctx, prev_is_code: bool) ->
 fn monospaced_char_counts(p: XmlNode, style_font: &str) -> (usize, usize) {
     let (mut mono, mut total) = (0usize, 0usize);
     for r in p.descendants().filter(|n| n.has_tag_name("r")) {
-        let text: String = r
-            .descendants()
-            .filter(|n| n.has_tag_name("t"))
-            .filter_map(|n| n.text())
-            .collect();
+        let text: String = r.descendants().filter_map(flat_text).collect();
         let len = text.trim().chars().count();
         if len == 0 {
             continue;
@@ -1843,7 +2070,7 @@ fn detect_code_language(text: &str) -> Option<String> {
 /// the code-block detector (docling PR #3735) read about a paragraph style.
 struct StyleMaps {
     names: HashMap<String, String>,
-    nums: HashMap<String, (String, i64)>,
+    nums: HashMap<String, (Option<String>, Option<i64>)>,
     based: HashMap<String, String>,
     fonts: HashMap<String, String>,
     /// styleId → the style's own `w:pPr/w:outlineLvl` as a 1-indexed docling
@@ -1879,8 +2106,8 @@ fn parse_styles(styles_xml: &str) -> StyleMaps {
         {
             names.insert(id.to_string(), name.to_string());
         }
-        if let Some(num) = num_pr(style) {
-            nums.insert(id.to_string(), num);
+        if let Some(parts) = num_pr_parts(style) {
+            nums.insert(id.to_string(), parts);
         }
         // basedOn chain and the style's own font — used by the code-block
         // detector (docling PR #3735) to walk a style's inheritance.
@@ -1926,6 +2153,9 @@ struct NumLevel {
     /// on such a level carries a `numPr` for outline structure only, so it
     /// gets no computed `1.2` prefix.
     visible: bool,
+    /// The level's raw `numFmt` (`decimal`, `lowerLetter`, `upperRoman`, …);
+    /// `None` when the level declares none.
+    num_fmt: Option<String>,
     start: i64,
     lvl_text: String,
 }
@@ -1992,6 +2222,7 @@ fn parse_numbering(numbering_xml: &str) -> HashMap<(String, i64), NumLevel> {
                 NumLevel {
                     numbered,
                     visible,
+                    num_fmt: num_fmt.map(str::to_string),
                     start,
                     lvl_text,
                 },
@@ -2007,6 +2238,69 @@ fn parse_numbering(numbering_xml: &str) -> HashMap<(String, i64), NumLevel> {
         }
     }
     out
+}
+
+/// Cap on the `basedOn` walk when resolving a style's numbering — docling's
+/// `_MAX_STYLE_INHERITANCE_DEPTH`.
+const MAX_STYLE_INHERITANCE_DEPTH: usize = 10;
+
+/// Whether a `numFmt` is a visible format other than plain `decimal` — the
+/// letter / roman / `decimalZero` levels whose `lvlText` suffix (`%2)` → `a)`)
+/// must be kept and whose counters cannot be rendered as raw decimals
+/// (docling's `_NON_DECIMAL_NUMBERING_FORMATS`, docling#4087).
+fn is_non_decimal_format(num_fmt: Option<&str>) -> bool {
+    num_fmt.is_some_and(|f| f != "decimal" && VISIBLE_NUMBERING_FORMATS.contains(&f))
+}
+
+/// Render a list counter with an OOXML `numFmt` — docling's
+/// `_format_enum_counter`: `lowerLetter`/`upperLetter` run a…z, aa…zz (the
+/// letter repeated), roman numerals, `decimalZero` pads to two digits, and
+/// everything else (including no format) is the plain decimal.
+fn format_enum_counter(counter: i64, num_fmt: Option<&str>) -> String {
+    let letter = |v: i64| -> String {
+        if v <= 0 {
+            return v.to_string();
+        }
+        let c = (b'a' + ((v - 1) % 26) as u8) as char;
+        std::iter::repeat_n(c, ((v - 1) / 26 + 1) as usize).collect()
+    };
+    let roman = |v: i64| -> String {
+        if v <= 0 {
+            return v.to_string();
+        }
+        const NUMERALS: [(i64, &str); 13] = [
+            (1000, "M"),
+            (900, "CM"),
+            (500, "D"),
+            (400, "CD"),
+            (100, "C"),
+            (90, "XC"),
+            (50, "L"),
+            (40, "XL"),
+            (10, "X"),
+            (9, "IX"),
+            (5, "V"),
+            (4, "IV"),
+            (1, "I"),
+        ];
+        let mut rest = v;
+        let mut out = String::new();
+        for (amount, numeral) in NUMERALS {
+            while rest >= amount {
+                out.push_str(numeral);
+                rest -= amount;
+            }
+        }
+        out
+    };
+    match num_fmt {
+        Some("lowerLetter") => letter(counter),
+        Some("upperLetter") => letter(counter).to_ascii_uppercase(),
+        Some("lowerRoman") => roman(counter).to_ascii_lowercase(),
+        Some("upperRoman") => roman(counter),
+        Some("decimalZero") => format!("{counter:02}"),
+        _ => counter.to_string(),
+    }
 }
 
 /// The `start` value for `(numId, ilvl)`, defaulting to 1.
@@ -2039,8 +2333,12 @@ fn get_list_counter(
 
 /// Build a list item's marker from its `lvlText` template — docling's
 /// `_build_enum_marker`. A template with literal text (e.g. `Proposal %1:`) has
-/// its `%N` placeholders substituted; a bare numeric template (`%1.%2.`) falls
-/// back to the hierarchical `1.2.` form joining `counter[0..=ilvl]`.
+/// its `%N` placeholders substituted; so does one on a letter / roman /
+/// `decimalZero` level even when it holds only placeholders and punctuation
+/// (`%2)` → `a)`, docling#4087 — before that guard such levels fell through
+/// to `1.a.`). A bare numeric template (`%1.%2.`) on a decimal level falls
+/// back to the hierarchical `1.2.` form joining `counter[0..=ilvl]`; every
+/// counter is rendered with its own level's `numFmt`.
 fn build_enum_marker(
     counters: &HashMap<(String, i64), i64>,
     num_levels: &HashMap<(String, i64), NumLevel>,
@@ -2053,6 +2351,11 @@ fn build_enum_marker(
             .copied()
             .unwrap_or_else(|| level_start(num_levels, num_id, lvl))
     };
+    let fmt_at = |lvl: i64| -> Option<&str> {
+        num_levels
+            .get(&(num_id.to_string(), lvl))
+            .and_then(|l| l.num_fmt.as_deref())
+    };
     let lvl_text = num_levels
         .get(&(num_id.to_string(), ilvl))
         .map(|l| l.lvl_text.as_str())
@@ -2061,22 +2364,342 @@ fn build_enum_marker(
     if re_placeholder.is_match(lvl_text) {
         let stripped: String = re_placeholder.replace_all(lvl_text, "").into_owned();
         let stripped = stripped.trim_matches(|c: char| " .)(:[]".contains(c));
-        if !stripped.is_empty() {
+        if !stripped.is_empty() || is_non_decimal_format(fmt_at(ilvl)) {
             return re_placeholder
                 .replace_all(lvl_text, |caps: &regex::Captures| {
                     let lvl_idx: i64 = caps[1].parse::<i64>().unwrap_or(1) - 1;
-                    counter_at(lvl_idx).to_string()
+                    format_enum_counter(counter_at(lvl_idx), fmt_at(lvl_idx))
                 })
                 .into_owned();
         }
     }
-    let parts: Vec<String> = (0..=ilvl).map(|lvl| counter_at(lvl).to_string()).collect();
+    let parts: Vec<String> = (0..=ilvl)
+        .map(|lvl| format_enum_counter(counter_at(lvl), fmt_at(lvl)))
+        .collect();
     parts.join(".") + "."
 }
 
 #[cfg(test)]
 mod tests {
-    use super::heading_label_level;
+    use super::{
+        block_comment_slots, child_elements, flat_text, format_enum_counter, heading_label_level,
+        plain_paragraph_text, row_cells, run_child_text, run_groups, Fmt,
+    };
+    use std::collections::HashMap;
+
+    /// #400: `<w:noBreakHyphen/>` is a hyphen Word will not wrap at, and
+    /// python-docx — where docling's paragraph text comes from — renders it as
+    /// a plain `-`. Dropping it glued `In` and `Transit` into `InTransit`.
+    /// A page or column break, by contrast, has *no* text equivalent there,
+    /// while a line break and a carriage return are newlines.
+    #[test]
+    fn run_inner_content_matches_python_docx() {
+        let xml = r#"<w:document xmlns:w="w"><w:body>
+            <w:p><w:r><w:t>In</w:t><w:noBreakHyphen/><w:t>Transit</w:t></w:r></w:p>
+            <w:p><w:r><w:t>a</w:t><w:tab/><w:t>b</w:t><w:ptab/><w:t>c</w:t></w:r></w:p>
+            <w:p><w:r><w:t>line</w:t><w:br/><w:t>wrap</w:t></w:r></w:p>
+            <w:p><w:r><w:t>soft</w:t><w:cr/><w:t>return</w:t></w:r></w:p>
+            <w:p><w:r><w:t>page</w:t><w:br w:type="page"/><w:t>break</w:t></w:r></w:p>
+        </w:body></w:document>"#;
+        let dom = roxmltree::Document::parse(xml).unwrap();
+        let runs = |p: roxmltree::Node<'_, '_>| -> String {
+            p.descendants()
+                .filter(|n| n.has_tag_name("r"))
+                .flat_map(child_elements)
+                .map(run_child_text)
+                .collect()
+        };
+        let texts: Vec<String> = dom
+            .descendants()
+            .filter(|n| n.has_tag_name("p"))
+            .map(runs)
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "In-Transit",
+                "a\tb\tc",
+                "line\nwrap",
+                "soft\nreturn",
+                "pagebreak",
+            ]
+        );
+        // The flattening helper carries the hyphen too, and nothing else: a
+        // `w:tab` under `w:pPr/w:tabs` is a tab *stop*, not text.
+        let props = roxmltree::Document::parse(
+            r#"<w:p xmlns:w="w"><w:pPr><w:tabs><w:tab w:val="left"/></w:tabs></w:pPr>
+               <w:r><w:t>co</w:t><w:noBreakHyphen/><w:t>op</w:t></w:r></w:p>"#,
+        )
+        .unwrap();
+        let flat: String = props
+            .root_element()
+            .descendants()
+            .filter_map(flat_text)
+            .collect();
+        assert_eq!(flat, "co-op");
+    }
+
+    /// docling#3946/#3951: Word wraps a table cell in a content control for
+    /// cover pages and document-property fields, so the `w:tc` is no longer a
+    /// direct child of the `w:tr`. Collecting only direct children skipped it,
+    /// which slid every later cell of the row one column to the left (the grid
+    /// cursor advances per emitted cell) and emptied a 1×1 layout table.
+    #[test]
+    fn a_cell_in_a_content_control_is_still_a_cell_of_its_row() {
+        let cell = |t: &str| format!("<w:tc><w:p><w:r><w:t>{t}</w:t></w:r></w:p></w:tc>");
+        let wrapped = |t: &str| {
+            format!(
+                "<w:sdt><w:sdtPr/><w:sdtContent>{}</w:sdtContent></w:sdt>",
+                cell(t)
+            )
+        };
+        let row = |body: String| {
+            format!(
+                r#"<w:document xmlns:w="w"><w:body><w:tbl><w:tr>{body}</w:tr></w:tbl></w:body></w:document>"#
+            )
+        };
+        let texts = |xml: &str| {
+            let dom = roxmltree::Document::parse(xml).unwrap();
+            let tr = dom.descendants().find(|n| n.has_tag_name("tr")).unwrap();
+            row_cells(tr)
+                .into_iter()
+                .map(|tc| {
+                    tc.descendants()
+                        .filter(|n| n.has_tag_name("t"))
+                        .filter_map(|n| n.text())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let plain = row(format!("{}{}{}", cell("a"), cell("b"), cell("c")));
+        let want = vec!["a".to_string(), "b".into(), "c".into()];
+        assert_eq!(texts(&plain), want);
+        // Wrapped in any position, the row keeps the same cells in the same order.
+        for xml in [
+            row(format!("{}{}{}", wrapped("a"), cell("b"), cell("c"))),
+            row(format!("{}{}{}", cell("a"), wrapped("b"), cell("c"))),
+            row(format!("{}{}{}", cell("a"), cell("b"), wrapped("c"))),
+            row(format!("{}{}{}", wrapped("a"), cell("b"), wrapped("c"))),
+        ] {
+            assert_eq!(texts(&xml), want);
+        }
+        // Controls nest, and a control holding nothing contributes no cell.
+        let nested = row(format!(
+            "<w:sdt><w:sdtContent>{}</w:sdtContent></w:sdt>{}",
+            wrapped("a"),
+            cell("b")
+        ));
+        assert_eq!(texts(&nested), vec!["a".to_string(), "b".into()]);
+        assert_eq!(
+            texts(&row("<w:sdt><w:sdtContent/></w:sdt>".to_string())),
+            Vec::<String>::new()
+        );
+    }
+
+    /// #408: docling's `_get_paragraph_elements` closes the trailing run group
+    /// under the format that *opened* it. A whitespace-only run never opens a
+    /// group — its text is appended to the current one — so a paragraph whose
+    /// bold or italic text is followed by an unformatted `" "` (Word writes
+    /// that trailing space as its own run) is still one bold/italic element.
+    /// We used the *last* run's format there, which reset it to plain.
+    #[test]
+    fn a_trailing_unformatted_space_keeps_the_paragraphs_format() {
+        let bold = Fmt {
+            bold: true,
+            ..Fmt::default()
+        };
+        let italic = Fmt {
+            italic: true,
+            ..Fmt::default()
+        };
+        let plain = Fmt::default();
+        let groups = |runs: Vec<(&str, Fmt)>| {
+            run_groups(
+                runs.into_iter()
+                    .map(|(t, f)| (t.to_string(), f, None))
+                    .collect(),
+            )
+            .into_iter()
+            .map(|(t, f, _)| (t, f))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            groups(vec![("Bold text.", bold), (" ", plain)]),
+            vec![("Bold text.".to_string(), bold)]
+        );
+        assert_eq!(
+            groups(vec![("Italic text.", italic), (" ", plain)]),
+            vec![("Italic text.".to_string(), italic)]
+        );
+        // A trailing run with real text still starts its own plain group …
+        assert_eq!(
+            groups(vec![("Bold text.", bold), (" Plain tail.", plain)]),
+            vec![
+                ("Bold text.".to_string(), bold),
+                ("Plain tail.".to_string(), plain)
+            ]
+        );
+        // … and whitespace *between* differently formatted runs joins the
+        // group it follows, exactly as upstream concatenates it.
+        assert_eq!(
+            groups(vec![("a", bold), (" ", plain), ("b", italic), (" ", plain)]),
+            vec![("a".to_string(), bold), ("b".to_string(), italic)]
+        );
+    }
+
+    /// #409: a code paragraph's text is python-docx's `Paragraph.text`, so a
+    /// `<w:br/>` — whether it sits in its own run or between the `w:t`s of one
+    /// run — is a newline and a tab is a tab. Flattening the subtree to `w:t`
+    /// alone joined `total = a + b` and `print(total)` into one line. A page
+    /// break still has no text, a hyperlink's runs count, a content control
+    /// contributes its `w:t` text (docling's `.//w:sdtContent//w:t` xpath).
+    #[test]
+    fn plain_paragraph_text_keeps_line_breaks_and_tabs() {
+        let xml = r#"<w:document xmlns:w="w"><w:body>
+            <w:p><w:pPr><w:pStyle w:val="Code"/></w:pPr>
+                <w:r><w:t xml:space="preserve">total = a + b</w:t></w:r><w:r><w:br/></w:r>
+                <w:r><w:t>print(total)</w:t></w:r><w:r><w:br/></w:r><w:r><w:t># done</w:t></w:r></w:p>
+            <w:p><w:r><w:t>x = 1</w:t><w:br/><w:t>y = 2</w:t><w:br/><w:t>z = x + y</w:t></w:r></w:p>
+            <w:p><w:r><w:t>if x:</w:t><w:br/><w:tab/><w:t>y</w:t><w:br w:type="page"/></w:r></w:p>
+            <w:p><w:r><w:t>see </w:t></w:r><w:hyperlink r:id="rId1" xmlns:r="r"><w:r><w:t>docs</w:t><w:br/><w:t>here</w:t></w:r></w:hyperlink></w:p>
+            <w:p><w:sdt><w:sdtContent><w:r><w:t>ctrl</w:t><w:br/><w:t>text</w:t></w:r></w:sdtContent></w:sdt></w:p>
+        </w:body></w:document>"#;
+        let dom = roxmltree::Document::parse(xml).unwrap();
+        let texts: Vec<String> = dom
+            .descendants()
+            .filter(|n| n.has_tag_name("p"))
+            .map(plain_paragraph_text)
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "total = a + b\nprint(total)\n# done",
+                "x = 1\ny = 2\nz = x + y",
+                "if x:\n\ty",
+                "see docs\nhere",
+                "ctrltext",
+            ]
+        );
+    }
+
+    /// #385: a list item's `first_in_list` is Word's list identity — a new
+    /// `numId`, or body text since the last item, opens a list; the items of
+    /// one `numId` continue it, across nesting and across an empty spacer
+    /// paragraph (docling's `_manage_list_structure` + its ListGroup cache).
+    /// The serializers draw every list boundary from this flag alone.
+    #[test]
+    fn list_boundaries_follow_word_list_identity() {
+        use crate::backend::DeclarativeBackend;
+        use docling_core::Node;
+        let convert = |name: &str| {
+            let path = format!(
+                "{}/../../tests/data/docx/sources/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let bytes = std::fs::read(&path).expect("fixture exists");
+            let src = crate::source::SourceDocument::from_bytes(
+                name,
+                crate::format::InputFormat::Docx,
+                bytes,
+            );
+            super::DocxBackend.convert(&src).expect("converts")
+        };
+        let flags = |doc: &docling_core::DoclingDocument| -> Vec<(String, bool)> {
+            doc.nodes
+                .iter()
+                .filter_map(|n| match n {
+                    Node::ListItem {
+                        text,
+                        first_in_list,
+                        ..
+                    } => Some((text.clone(), *first_in_list)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let lists = flags(&convert("docx_lists.docx"));
+        let flag = |t: &str| {
+            lists
+                .iter()
+                .find(|(text, _)| text == t)
+                .unwrap_or_else(|| panic!("item {t:?} in {lists:?}"))
+                .1
+        };
+        // Test 1: one bullet list.
+        assert!(flag("List item 1"));
+        assert!(!flag("List item 2"));
+        // Test 3: nested items share the parent's numId — no new list.
+        assert!(!flag("List item 1.1"));
+        // Test 7: four items of numId 2, then two single-item lists, each a
+        // numId of its own, separated by empty paragraphs.
+        assert!(flag("First item with numId 2"));
+        assert!(!flag("Fourth item with numId 2"));
+        let singles: Vec<bool> = lists
+            .iter()
+            .filter(|(t, _)| t == "Single item of a new list")
+            .map(|(_, f)| *f)
+            .collect();
+        assert_eq!(singles, vec![true, true]);
+        // docling#3902: prose between two items of one Word list ends it, an
+        // empty spacer paragraph does not — `2. Second section` continues
+        // the list that `- 1.2. Sub two` reopened after the prose.
+        let spacer = flags(&convert("docx_list_blank_spacer.docx"));
+        assert_eq!(
+            spacer,
+            vec![
+                ("First section".to_string(), true),
+                ("1.1. Sub one".to_string(), false),
+                ("1.2. Sub two".to_string(), true),
+                ("Second section".to_string(), false),
+            ]
+        );
+    }
+
+    /// docling's `_format_enum_counter`: letters wrap by repetition (aa, bb),
+    /// roman numerals in either case, `decimalZero` pads to two digits.
+    #[test]
+    fn enum_counters_follow_num_fmt() {
+        assert_eq!(format_enum_counter(1, Some("lowerLetter")), "a");
+        assert_eq!(format_enum_counter(26, Some("lowerLetter")), "z");
+        assert_eq!(format_enum_counter(27, Some("upperLetter")), "AA");
+        assert_eq!(format_enum_counter(4, Some("lowerRoman")), "iv");
+        assert_eq!(format_enum_counter(1994, Some("upperRoman")), "MCMXCIV");
+        assert_eq!(format_enum_counter(7, Some("decimalZero")), "07");
+        assert_eq!(format_enum_counter(7, Some("decimal")), "7");
+        assert_eq!(format_enum_counter(7, None), "7");
+        assert_eq!(format_enum_counter(0, Some("lowerLetter")), "0");
+    }
+
+    /// A comment range that opens in one paragraph and closes in a later one
+    /// annotates every paragraph in between; `w:commentReference` alone (Word's
+    /// range-less anchor) annotates just its own paragraph.
+    #[test]
+    fn comment_ranges_span_paragraphs() {
+        let xml = r#"<w:document xmlns:w="w">
+          <w:body>
+            <w:p><w:commentRangeStart w:id="0"/><w:r><w:t>a</w:t></w:r></w:p>
+            <w:p><w:r><w:t>b</w:t></w:r></w:p>
+            <w:p><w:commentRangeEnd w:id="0"/><w:commentReference w:id="0"/></w:p>
+            <w:p><w:r><w:t>d</w:t></w:r></w:p>
+            <w:p><w:commentReference w:id="1"/></w:p>
+          </w:body>
+        </w:document>"#;
+        let dom = roxmltree::Document::parse(xml).unwrap();
+        let body = dom.descendants().find(|n| n.has_tag_name("body")).unwrap();
+        let slot_of: HashMap<&str, usize> = [("0", 0), ("1", 1)].into_iter().collect();
+        let mut open = Vec::new();
+        let slots: Vec<Vec<usize>> = body
+            .children()
+            .filter(|n| n.is_element())
+            .map(|p| block_comment_slots(p, &slot_of, &mut open))
+            .collect();
+        assert_eq!(
+            slots,
+            vec![vec![0], vec![0], vec![0], Vec::new(), vec![1]],
+            "ranges must cover the paragraphs between start and end"
+        );
+        assert!(open.is_empty(), "the closed range must not stay open");
+    }
 
     /// The `_get_heading_and_level` + `_split_text_and_number` lattice on a
     /// single label (#270 tail); levels are Markdown levels (docling + 1).

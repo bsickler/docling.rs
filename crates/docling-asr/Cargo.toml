@@ -16,12 +16,17 @@ cuda = ["docling-onnx/cuda"]
 tensorrt = ["docling-onnx/tensorrt"]
 directml = ["docling-onnx/directml"]
 coreml = ["docling-onnx/coreml"]
+# CPU-class XNNPACK (#324). Opt-in and out of every CI matrix by design: pyke
+# ships no prebuilt ONNX Runtime carrying this EP, so it links only against a
+# self-built runtime (`ORT_LIB_LOCATION`, onnxruntime built with
+# `--use_xnnpack`).
+xnnpack = ["docling-onnx/xnnpack"]
 
 [dependencies]
-docling-core = { path = "../docling-core", version = "1.31.0" }
+docling-core = { path = "../docling-core", version = "1.50.3" }
 # Shared ONNX execution-provider selection (DOCLING_RS_EP, #288) — routes the
 # Whisper encoder/decoder sessions through the same switch as docling-pdf.
-docling-onnx = { path = "../docling-onnx", version = "1.31.0" }
+docling-onnx = { path = "../docling-onnx", version = "1.50.3" }
 # Same ort as docling-pdf so the workspace keeps a single ONNX runtime.
 ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-rustls"] }
 serde_json = "1"

@@ -84,6 +84,9 @@
         "$ref": "#/pictures/0"
       },
       {
+        "$ref": "#/texts/26"
+      },
+      {
         "$ref": "#/pictures/1"
       }
     ],
@@ -308,8 +311,8 @@
       "prov": [],
       "orig": "Nested ordered item 1",
       "text": "Nested ordered item 1",
-      "enumerated": false,
-      "marker": "-"
+      "enumerated": true,
+      "marker": "1."
     },
     {
       "self_ref": "#/texts/8",
@@ -326,8 +329,8 @@
       "prov": [],
       "orig": "Nested ordered item 2",
       "text": "Nested ordered item 2",
-      "enumerated": false,
-      "marker": "-"
+      "enumerated": true,
+      "marker": "2."
     },
     {
       "self_ref": "#/texts/9",
@@ -372,8 +375,8 @@
       "prov": [],
       "orig": "Nested ordered item 1",
       "text": "Nested ordered item 1",
-      "enumerated": false,
-      "marker": "-"
+      "enumerated": true,
+      "marker": "1."
     },
     {
       "self_ref": "#/texts/12",
@@ -390,8 +393,8 @@
       "prov": [],
       "orig": "Nested ordered item 2",
       "text": "Nested ordered item 2",
-      "enumerated": false,
-      "marker": "-"
+      "enumerated": true,
+      "marker": "2."
     },
     {
       "self_ref": "#/texts/13",
@@ -418,8 +421,8 @@
       "prov": [],
       "orig": "Nested ordered item 2",
       "text": "Nested ordered item 2",
-      "enumerated": false,
-      "marker": "-"
+      "enumerated": true,
+      "marker": "3."
     },
     {
       "self_ref": "#/texts/15",
@@ -560,7 +563,7 @@
     {
       "self_ref": "#/texts/26",
       "parent": {
-        "$ref": "#/pictures/1"
+        "$ref": "#/body"
       },
       "children": [],
       "content_layer": "body",
@@ -739,6 +742,7 @@
         ],
         "num_rows": 3,
         "num_cols": 3,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -962,6 +966,7 @@
         ],
         "num_rows": 3,
         "num_cols": 2,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -1185,6 +1190,7 @@
         ],
         "num_rows": 3,
         "num_cols": 3,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -1447,6 +1453,7 @@
         ],
         "num_rows": 3,
         "num_cols": 3,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -1800,6 +1807,7 @@
         ],
         "num_rows": 4,
         "num_cols": 4,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -2454,6 +2462,7 @@
         ],
         "num_rows": 8,
         "num_cols": 4,
+        "orientation": "rot_0",
         "grid": [
           [
             {

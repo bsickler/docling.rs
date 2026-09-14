@@ -31,8 +31,13 @@ use crate::source::SourceDocument;
 pub(crate) type Merges = Vec<((u32, u32), (u32, u32))>;
 
 /// One sheet's assembled content: `(bbox in cell units, node)` items in
-/// discovery order, plus the sheet's comment lines.
-type SheetItems = (Vec<((usize, usize, usize, usize), Node)>, Vec<String>);
+/// discovery order, plus the sheet's comments as `(row, col, cell ref, line)` —
+/// the coordinates locate the item each comment annotates, the cell ref names
+/// its `comment_section` group (docling's `comment-{sheet}-{cell}`).
+type SheetComment = (usize, usize, String, String);
+type SheetItems = (Vec<((usize, usize, usize, usize), Node)>, Vec<SheetComment>);
+/// A sheet item with its docling creation rank: `(seq, bbox, node)`.
+type RankedItem = (usize, (usize, usize, usize, usize), Node);
 
 /// Load one sheet's merged regions (`<mergeCells>`), absolute coordinates.
 fn sheet_merges<R: std::io::Read + std::io::Seek>(wb: &mut Xlsx<R>, name: &str) -> Merges {
@@ -151,7 +156,10 @@ impl DeclarativeBackend for XlsxBackend {
         };
 
         let mut doc = DoclingDocument::new(&source.name);
-        let mut comments: Vec<String> = Vec::new();
+        // Every sheet's comments, in workbook order — the order they become
+        // `comment_section` groups below, which is the order `Node::Commented`
+        // indices refer to.
+        let mut comments: Vec<(String, String)> = Vec::new();
         // Each sheet's items (tables, drawings, charts, comments) assemble in
         // parallel, one package clone per worker; the ordered collect and the
         // sequential merge below keep node order, page breaks, and the
@@ -180,20 +188,88 @@ impl DeclarativeBackend for XlsxBackend {
         // serializes each sheet group before the page-break node that the
         // item iterator placed inside it).
         let mut prev_item_page: Option<usize> = None;
-        for (page_ix, ((_, _, visible), (mut items, sheet_comments))) in
+        for (page_ix, ((sheet_name, _, visible), (mut items, sheet_comments))) in
             metas.iter().zip(per_sheet).enumerate()
         {
             let hidden = !matches!(visible, calamine::SheetVisible::Visible);
-            comments.extend(sheet_comments);
+            // Each comment takes a slot in the document-wide `comment_section`
+            // run — row-major within the sheet, sheets in workbook order, which
+            // is the order the groups are appended in below.
+            let slots: Vec<(usize, usize, usize)> = sheet_comments
+                .iter()
+                .map(|(row, col, cell, text)| {
+                    let slot = comments.len();
+                    comments.push((format!("comment-{sheet_name}-{cell}"), text.clone()));
+                    (slot, *row, *col)
+                })
+                .collect();
+            // Every sheet is a page of the JSON (`pages`), sized like docling's
+            // `_find_page_size`: the largest right/bottom edge of its items, in
+            // cell units — 0×0 for a sheet without any.
+            let page_no = page_ix + 1;
             if items.is_empty() {
+                doc.push(Node::PageInfo {
+                    page_no,
+                    width: 0.0,
+                    height: 0.0,
+                });
+                // docling still opens a group for a sheet with no items (an
+                // empty chartsheet), so the sheet count survives into the JSON.
+                doc.push(sheet_group(sheet_name, hidden, Vec::new()));
                 continue;
             }
-            // docling sorts a sheet's children by top coordinate (stable).
-            items.sort_by_key(|((_, t, _, _), _)| *t);
+            // docling creates a sheet's items in three passes — the tables
+            // (each label right before its table), then the images, then the
+            // charts (in drawing order) — which is the order it numbers them
+            // (`#/tables/N`, `#/texts/N`, `#/pictures/N`); the group's
+            // children are then sorted by top coordinate, stably, so items
+            // sharing a top keep that creation order too. Reproduce both: rank
+            // by creation, then sort by top and carry the rank along.
+            let pass = |n: &Node| match n {
+                Node::Picture { .. } => 1,
+                Node::Chart { .. } => 2,
+                _ => 0,
+            };
+            items.sort_by_key(|(_, n)| pass(n));
+            let mut items: Vec<RankedItem> = items
+                .into_iter()
+                .enumerate()
+                .map(|(seq, (bbox, node))| (seq, bbox, node))
+                .collect();
+            items.sort_by_key(|(_, (_, t, _, _), _)| *t);
+            // docling's `_find_cell_item`: a comment annotates the item whose
+            // cell range covers the commented cell (resolved after the sort, so
+            // the indices address the emitted order).
+            let mut annotations: Vec<Vec<usize>> = vec![Vec::new(); items.len()];
+            for (slot, row, col) in slots {
+                if let Some(ix) = items
+                    .iter()
+                    // The item bboxes are half-open on the right/bottom edge
+                    // (`max + 1`), like the ranges `find_tables` reports.
+                    .position(|(_, (l, t, r, b), _)| {
+                        (*l..*r).contains(&col) && (*t..*b).contains(&row)
+                    })
+                {
+                    annotations[ix].push(slot);
+                }
+            }
             // Location provenance against the sheet's extent.
-            let page_w = items.iter().map(|((_, _, r, _), _)| *r).max().unwrap_or(1);
-            let page_h = items.iter().map(|((_, _, _, b), _)| *b).max().unwrap_or(1);
-            for ((l, t, r, b), node) in &mut items {
+            let page_w = items
+                .iter()
+                .map(|(_, (_, _, r, _), _)| *r)
+                .max()
+                .unwrap_or(1);
+            let page_h = items
+                .iter()
+                .map(|(_, (_, _, _, b), _)| *b)
+                .max()
+                .unwrap_or(1);
+            doc.push(Node::PageInfo {
+                page_no,
+                width: page_w as f32,
+                height: page_h as f32,
+            });
+            for (_, (l, t, r, b), node) in &mut items {
                 let loc = [
                     location_value(*l, page_w),
                     location_value(*t, page_h),
@@ -207,7 +283,8 @@ impl DeclarativeBackend for XlsxBackend {
                     _ => {}
                 }
             }
-            for ((l, t, r, b), node) in items {
+            let mut children = Vec::with_capacity(items.len());
+            for (ix, (seq, (l, t, r, b), node)) in items.into_iter().enumerate() {
                 let node = if let Node::Picture { .. } = &node {
                     Node::Located {
                         location: [
@@ -221,16 +298,32 @@ impl DeclarativeBackend for XlsxBackend {
                 } else {
                     node
                 };
-                let node = if hidden {
-                    Node::Furniture {
-                        layer: docling_core::ContentLayer::Invisible,
+                let node = if annotations[ix].is_empty() {
+                    node
+                } else {
+                    Node::Commented {
+                        comments: std::mem::take(&mut annotations[ix]),
                         inner: Box::new(node),
                     }
-                } else {
-                    node
                 };
-                doc.push(node);
+                // docling's provenance for a sheet item is its cell-index box
+                // verbatim (top-left origin) with a `(0, 0)` charspan — for the
+                // table, the section label above it, a picture, a chart. The
+                // DocLang grid above cannot carry those integers exactly, so
+                // the JSON reads them from this wrapper.
+                children.push(Node::Prov {
+                    page_no,
+                    bbox: [l as f32, t as f32, r as f32, b as f32],
+                    charspan: [0, 0],
+                    seq: Some(seq),
+                    inner: Box::new(node),
+                });
             }
+            // A hidden sheet's group carries the invisible layer, which the
+            // serializers stamp on every item inside it — the same output the
+            // old per-item `Node::Furniture` wrapper produced in DocLang, and
+            // docling's shape in the JSON.
+            doc.push(sheet_group(sheet_name, hidden, children));
             // DocLang page break: trails this sheet's content when an earlier
             // sheet already produced items (see module docs).
             if prev_item_page.is_some() {
@@ -238,13 +331,31 @@ impl DeclarativeBackend for XlsxBackend {
             }
             prev_item_page = Some(page_ix + 1);
         }
-        for line in comments {
-            doc.nodes.push(Node::Furniture {
-                layer: docling_core::ContentLayer::Notes,
-                inner: Box::new(Node::Paragraph { text: line }),
+        for (name, text) in comments {
+            doc.nodes.push(Node::CommentSection {
+                name,
+                text,
+                // The xlsx backend goes through docling-core's `add_comment`,
+                // which links the note text item itself (the docx backend
+                // overrides that with the group).
+                refs_note_text: true,
+                grouped: true,
             });
         }
         Ok(doc)
+    }
+}
+
+/// docling's per-sheet group: `label: "sheet"`, named after the worksheet, on
+/// the invisible content layer when the sheet is hidden. DocLang has no group
+/// element, so this is transparent there; the JSON gets docling's `sheet` group
+/// with the sheet's items as its children.
+fn sheet_group(name: &str, hidden: bool, children: Vec<Node>) -> Node {
+    Node::Group {
+        label: "sheet".to_string(),
+        name: Some(name.to_string()),
+        layer: hidden.then_some(docling_core::ContentLayer::Invisible),
+        children,
     }
 }
 
@@ -276,12 +387,11 @@ fn convert_xlsb(
         let Ok(range) = workbook.worksheet_range(name) else {
             continue;
         };
-        let (rs_r, rs_c) = range.start().unwrap_or((0, 0));
-        let (or, oc) = (rs_r as usize, rs_c as usize);
-        let (height, width) = range.get_size();
-        let merge_of = HashMap::new();
+        // The binary reader exposes no merges, so the frame is the range itself.
+        let frame = sheet_frame(&range, &Merges::new());
+        let (or, oc) = frame.origin;
         let mut items: Vec<((usize, usize, usize, usize), Node)> = Vec::new();
-        for t in find_tables(&range, &merge_of, height, width, skip_empty) {
+        for t in find_tables(&range, &frame, skip_empty) {
             if let Some(label) = t.label {
                 items.push((
                     (
@@ -310,6 +420,7 @@ fn convert_xlsb(
         let page_w = items.iter().map(|((_, _, r, _), _)| *r).max().unwrap_or(1);
         let page_h = items.iter().map(|((_, _, _, b), _)| *b).max().unwrap_or(1);
         let hidden = !matches!(visible, calamine::SheetVisible::Visible);
+        let mut children = Vec::with_capacity(items.len());
         for ((l, t, r, b), mut node) in items {
             if let Node::Table(table) = &mut node {
                 table.location = Some([
@@ -319,16 +430,9 @@ fn convert_xlsb(
                     location_value(b, page_h),
                 ]);
             }
-            let node = if hidden {
-                Node::Furniture {
-                    layer: docling_core::ContentLayer::Invisible,
-                    inner: Box::new(node),
-                }
-            } else {
-                node
-            };
-            doc.push(node);
+            children.push(node);
         }
+        doc.push(sheet_group(name, hidden, children));
         // Same trailing page-break convention as the xlsx path above.
         if prev_sheet_had_items {
             doc.push(Node::PageBreak);
@@ -369,29 +473,18 @@ fn sheet_items<F: Fn(&str, &str) -> Vec<String> + Sync>(ctx: SheetCtx<'_, F>) ->
         resolve_ref,
         skip_empty,
     } = ctx;
-    let mut comments: Vec<String> = Vec::new();
+    let mut comments: Vec<SheetComment> = Vec::new();
     // (bbox in cell units, node) items for this sheet/page.
     let mut items: Vec<((usize, usize, usize, usize), Node)> = Vec::new();
 
     if matches!(typ, calamine::SheetType::WorkSheet) {
         if let Some((range, abs_merges)) = ranges.get(name) {
-            let (rs_r, rs_c) = range.start().unwrap_or((0, 0));
-            let mut merge_of: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
-            for &((sr, sc), (er, ec)) in abs_merges {
-                let tl = ((sr - rs_r) as usize, (sc - rs_c) as usize);
-                for r in sr..=er {
-                    for c in sc..=ec {
-                        merge_of.insert(((r - rs_r) as usize, (c - rs_c) as usize), tl);
-                    }
-                }
-            }
-            let (rh, rw) = range.get_size();
-            let height = rh.max(merge_of.keys().map(|(r, _)| r + 1).max().unwrap_or(0));
-            let width = rw.max(merge_of.keys().map(|(_, c)| c + 1).max().unwrap_or(0));
+            let frame = sheet_frame(range, abs_merges);
             // docling's bboxes are in *absolute* cell indices; calamine's
-            // range is clipped to its first non-empty row/column.
-            let (or, oc) = (rs_r as usize, rs_c as usize);
-            for t in find_tables(range, &merge_of, height, width, skip_empty) {
+            // range is clipped to its first non-empty row/column, and the
+            // frame reaches back over any merge that starts before it.
+            let (or, oc) = frame.origin;
+            for t in find_tables(range, &frame, skip_empty) {
                 if let Some(label) = t.label {
                     // The label row sits directly above the table's region.
                     items.push((
@@ -445,6 +538,7 @@ fn sheet_items<F: Fn(&str, &str) -> Vec<String> + Sync>(ctx: SheetCtx<'_, F>) ->
                                 caption_href: None,
                                 image: dimages.get(&rid).cloned(),
                                 classification: None,
+                                caption_parent: Default::default(),
                             },
                         ));
                     }
@@ -497,7 +591,7 @@ fn sheet_items<F: Fn(&str, &str) -> Vec<String> + Sync>(ctx: SheetCtx<'_, F>) ->
                 .map(|xml| xlsx_drawings::parse_threaded_comments(&xml, persons))
                 .unwrap_or_default();
             // Row-major over commented cells (docling scans the grid).
-            let mut cells: Vec<(usize, usize, String)> = legacy
+            let mut cells: Vec<SheetComment> = legacy
                 .iter()
                 .filter_map(|(cell, author, text)| {
                     let (c, r) = cell_ref_pub(cell)?;
@@ -508,11 +602,11 @@ fn sheet_items<F: Fn(&str, &str) -> Vec<String> + Sync>(ctx: SheetCtx<'_, F>) ->
                         },
                         None => format!("[author: {author}]: {text}"),
                     };
-                    Some((r, c, line))
+                    Some((r, c, cell.clone(), line))
                 })
                 .collect();
-            cells.sort_by_key(|(r, c, _)| (*r, *c));
-            comments.extend(cells.into_iter().map(|(_, _, line)| line));
+            cells.sort_by_key(|(r, c, _, _)| (*r, *c));
+            comments.extend(cells);
         }
     }
 
@@ -613,6 +707,57 @@ pub(crate) fn location_value(coord: usize, page: usize) -> u16 {
     v.clamp(0, LOC_RESOLUTION as i64 - 1) as u16
 }
 
+/// The cell frame one sheet is scanned in — docling's `_find_true_data_bounds`:
+/// the union of the cells carrying a value and *every* merged range, so a merge
+/// that starts above or to the left of the first value still fits.
+///
+/// calamine's `Range` is clipped to the first non-empty row/column, and merges
+/// are absolute, so rebasing a merge on the range origin underflowed for a
+/// merge that begins before any data (#395: `attempt to subtract with
+/// overflow`, an empty `A1:C1` above a table starting at `A3`). The frame
+/// origin is the minimum of the two instead, and `shift` records how far it
+/// reaches beyond the range so cell lookups can rebase back.
+pub(crate) struct SheetFrame {
+    /// Rows/columns the frame extends above/left of calamine's range origin.
+    pub(crate) shift: (usize, usize),
+    /// Frame origin in absolute cell coordinates (docling's bbox space).
+    pub(crate) origin: (usize, usize),
+    pub(crate) height: usize,
+    pub(crate) width: usize,
+    /// Frame position → the top-left of the merge covering it.
+    pub(crate) merge_of: HashMap<(usize, usize), (usize, usize)>,
+}
+
+pub(crate) fn sheet_frame(range: &Range<Data>, merges: &Merges) -> SheetFrame {
+    let (rs_r, rs_c) = range.start().unwrap_or((0, 0));
+    // Reach back to the earliest merge start, never past cell (0, 0).
+    let (mut or, mut oc) = (rs_r, rs_c);
+    for &((sr, sc), _) in merges {
+        or = or.min(sr);
+        oc = oc.min(sc);
+    }
+    let shift = ((rs_r - or) as usize, (rs_c - oc) as usize);
+    let mut merge_of: HashMap<(usize, usize), (usize, usize)> = HashMap::new();
+    for &((sr, sc), (er, ec)) in merges {
+        let tl = ((sr - or) as usize, (sc - oc) as usize);
+        for r in sr..=er {
+            for c in sc..=ec {
+                merge_of.insert(((r - or) as usize, (c - oc) as usize), tl);
+            }
+        }
+    }
+    let (rh, rw) = range.get_size();
+    let height = (rh + shift.0).max(merge_of.keys().map(|(r, _)| r + 1).max().unwrap_or(0));
+    let width = (rw + shift.1).max(merge_of.keys().map(|(_, c)| c + 1).max().unwrap_or(0));
+    SheetFrame {
+        shift,
+        origin: (or as usize, oc as usize),
+        height,
+        width,
+        merge_of,
+    }
+}
+
 /// A discovered table with its cell-index bounding box (inclusive), used to
 /// compute the DocLang `<location>` provenance.
 pub(crate) struct FoundTable {
@@ -641,22 +786,30 @@ pub(crate) struct FoundTable {
 /// up), while a dense region is byte-identical to the default path.
 pub(crate) fn find_tables(
     range: &Range<Data>,
-    merge_of: &HashMap<(usize, usize), (usize, usize)>,
-    height: usize,
-    width: usize,
+    frame: &SheetFrame,
     skip_empty: bool,
 ) -> Vec<FoundTable> {
-    let has_content = |r: usize, c: usize| -> bool {
-        merge_of.contains_key(&(r, c))
-            || range
-                .get((r, c))
-                .map(|d| !matches!(d, Data::Empty))
-                .unwrap_or(false)
+    let SheetFrame {
+        shift,
+        height,
+        width,
+        merge_of,
+        ..
+    } = frame;
+    let (height, width) = (*height, *width);
+    // A frame position rebased onto calamine's clipped range — `None` where the
+    // frame reaches above/left of it (rows only a merge extends into).
+    let value_at = |r: usize, c: usize| -> Option<&Data> {
+        range.get((r.checked_sub(shift.0)?, c.checked_sub(shift.1)?))
     };
+    let has_value =
+        |r: usize, c: usize| -> bool { value_at(r, c).is_some_and(|d| !matches!(d, Data::Empty)) };
+    let has_content =
+        |r: usize, c: usize| -> bool { merge_of.contains_key(&(r, c)) || has_value(r, c) };
     // A grid position renders the value of its merge's top-left cell, if merged.
     let cell_text = |r: usize, c: usize| -> String {
         let (sr, sc) = merge_of.get(&(r, c)).copied().unwrap_or((r, c));
-        range.get((sr, sc)).map(format_cell).unwrap_or_default()
+        value_at(sr, sc).map(format_cell).unwrap_or_default()
     };
 
     let mut visited: HashSet<(usize, usize)> = HashSet::new();
@@ -664,7 +817,11 @@ pub(crate) fn find_tables(
 
     for r in 0..height {
         for c in 0..width {
-            if !has_content(r, c) || visited.contains(&(r, c)) {
+            // docling seeds a table only from a cell that carries a value
+            // (`if cell.value is None: continue`); a merge is absorbed by the
+            // flood fill below, but an empty one never starts a table of its
+            // own (#395).
+            if !has_value(r, c) || visited.contains(&(r, c)) {
                 continue;
             }
             // Flood fill from this seed over 4-connected content cells.
@@ -796,6 +953,7 @@ pub(crate) fn find_tables(
                     cell_blocks: None,
                     cells: None,
                     caption: None,
+                    caption_parent: Default::default(),
                 },
                 label,
                 min_r,
@@ -844,6 +1002,101 @@ mod tests {
     use crate::backend::DeclarativeBackend;
     use crate::{InputFormat, SourceDocument};
 
+    /// Every sheet's items live inside that sheet's group, so tests that look
+    /// for a node by kind flatten the groups away first.
+    /// The item nodes, looking through sheet groups and the provenance /
+    /// comment wrappers each item sits in.
+    fn flatten(nodes: &[Node]) -> Vec<&Node> {
+        nodes
+            .iter()
+            .flat_map(|n| match n {
+                Node::Group { children, .. } => flatten(children),
+                Node::Prov { inner, .. } | Node::Commented { inner, .. } => {
+                    flatten(std::slice::from_ref(inner))
+                }
+                other => vec![other],
+            })
+            .collect()
+    }
+
+    /// #395: calamine clips a sheet's range to its first non-empty row/column,
+    /// so a merge that begins before any data used to underflow the subtraction
+    /// that rebased it (`attempt to subtract with overflow`). The frame reaches
+    /// back to the earliest merge instead — docling's `_find_true_data_bounds`.
+    #[test]
+    fn a_merge_before_the_data_does_not_underflow_the_frame() {
+        // Data at C3:D4, an empty merge at A1:B2 — above *and* left of it.
+        let mut range: Range<Data> = Range::new((2, 2), (3, 3));
+        range.set_value((2, 2), Data::String("Name".into()));
+        range.set_value((2, 3), Data::String("Qty".into()));
+        range.set_value((3, 2), Data::String("Bolt".into()));
+        range.set_value((3, 3), Data::Int(4));
+        let frame = sheet_frame(&range, &vec![((0, 0), (1, 1))]);
+        assert_eq!(frame.origin, (0, 0), "the frame starts at the merge");
+        assert_eq!(frame.shift, (2, 2), "two rows/columns before the range");
+        assert_eq!((frame.height, frame.width), (4, 4));
+        assert_eq!(frame.merge_of.get(&(0, 0)), Some(&(0, 0)));
+        assert_eq!(frame.merge_of.get(&(1, 1)), Some(&(0, 0)));
+
+        // An *empty* merge is not a table of its own: docling seeds a table
+        // only from a cell that carries a value, so only the data is found —
+        // and it keeps its absolute position in the frame.
+        let found = find_tables(&range, &frame, false);
+        assert_eq!(found.len(), 1, "the empty merge seeds nothing");
+        assert_eq!(
+            found[0].table.rows,
+            vec![vec!["Name", "Qty"], vec!["Bolt", "4"]]
+        );
+        assert_eq!(
+            (
+                found[0].min_r,
+                found[0].min_c,
+                found[0].max_r,
+                found[0].max_c
+            ),
+            (2, 2, 3, 3)
+        );
+    }
+
+    /// The reporter's own geometry (#395): an empty `B1:N1` above *and to the
+    /// right of* the only value, in `A2`. The row axis underflowed; the column
+    /// axis had to grow instead.
+    #[test]
+    fn a_merge_above_and_right_of_the_data_keeps_both_axes() {
+        let mut range: Range<Data> = Range::new((1, 0), (1, 0));
+        range.set_value((1, 0), Data::String("data".into()));
+        let frame = sheet_frame(&range, &vec![((0, 1), (0, 13))]);
+        assert_eq!(
+            frame.origin,
+            (0, 0),
+            "up to the merge's row, out to column A"
+        );
+        assert_eq!(frame.shift, (1, 0), "one row before the range, no columns");
+        assert_eq!(
+            (frame.height, frame.width),
+            (2, 14),
+            "the merge's row above, and out to column N"
+        );
+        // Only the valued cell is a table; the empty merge beside it is not.
+        let found = find_tables(&range, &frame, false);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].table.rows, vec![vec!["data"]]);
+        assert_eq!((found[0].min_r, found[0].min_c), (1, 0));
+    }
+
+    /// Without merges the frame is calamine's range, unshifted — the ordinary
+    /// case, and the one the binary (xlsb) reader always takes.
+    #[test]
+    fn a_sheet_without_merges_keeps_the_range_frame() {
+        let mut range: Range<Data> = Range::new((1, 1), (2, 2));
+        range.set_value((1, 1), Data::String("a".into()));
+        let frame = sheet_frame(&range, &Merges::new());
+        assert_eq!(frame.origin, (1, 1));
+        assert_eq!(frame.shift, (0, 0));
+        assert_eq!((frame.height, frame.width), (2, 2));
+        assert!(frame.merge_of.is_empty());
+    }
+
     /// #271: `skip_empty` omits empty positions from each row of a ragged
     /// region instead of padding its bounding box; a dense region (or the
     /// default mode) is untouched, and a table that lost cells drops its
@@ -858,16 +1111,24 @@ mod tests {
         range.set_value((1, 1), Data::String("c".into()));
         range.set_value((2, 1), Data::String("d".into()));
         range.set_value((2, 2), Data::String("e".into()));
-        let merges = HashMap::new();
+        let frame = |merge_of: HashMap<(usize, usize), (usize, usize)>,
+                     height: usize,
+                     width: usize| SheetFrame {
+            shift: (0, 0),
+            origin: (0, 0),
+            height,
+            width,
+            merge_of,
+        };
 
-        let padded = find_tables(&range, &merges, 3, 3, false);
+        let padded = find_tables(&range, &frame(HashMap::new(), 3, 3), false);
         assert_eq!(
             padded[0].table.rows,
             vec![vec!["a", "b", ""], vec!["", "c", ""], vec!["", "d", "e"]],
             "default: the full bounding box materialises"
         );
 
-        let compact = find_tables(&range, &merges, 3, 3, true);
+        let compact = find_tables(&range, &frame(HashMap::new(), 3, 3), true);
         assert_eq!(
             compact[0].table.rows,
             vec![vec!["a", "b"], vec!["c"], vec!["d", "e"]],
@@ -895,7 +1156,7 @@ mod tests {
         range2.set_value((0, 0), Data::String("tall".into()));
         range2.set_value((0, 1), Data::String("a".into()));
         range2.set_value((1, 1), Data::String("b".into()));
-        let dense = find_tables(&range2, &merged, 2, 2, true);
+        let dense = find_tables(&range2, &frame(merged, 2, 2), true);
         assert_eq!(
             dense[0].table.rows,
             vec![vec!["tall", "a"], vec!["tall", "b"]],
@@ -907,30 +1168,93 @@ mod tests {
         );
     }
 
+    /// docling's sheet groups and cell comments: each worksheet becomes a
+    /// `sheet` group named after it, and every cell note becomes a
+    /// `comment-{sheet}-{cell}` section that the item covering the cell points
+    /// at (docling's `_find_cell_item`).
+    #[test]
+    fn sheet_groups_and_cell_comments() {
+        let path = format!(
+            "{}/../../tests/data/xlsx/sources/xlsx_comments.xlsx",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let bytes = std::fs::read(&path).expect("fixture exists");
+        let src = SourceDocument::from_bytes("x.xlsx", InputFormat::Xlsx, bytes);
+        let doc = XlsxBackend::default().convert(&src).expect("converts");
+
+        // The sheet's page marker leads; the group follows it.
+        let Some(Node::Group {
+            label,
+            name,
+            layer,
+            children,
+        }) = doc.nodes.iter().find(|n| matches!(n, Node::Group { .. }))
+        else {
+            panic!("no sheet group in {:?}", doc.nodes);
+        };
+        assert_eq!(
+            (label.as_str(), name.as_deref(), *layer),
+            ("sheet", Some("Sheet1"), None)
+        );
+        assert_eq!(children.len(), 3, "the sheet's three tables");
+
+        // The comment sections follow the sheets, in row-major cell order.
+        let sections: Vec<&str> = doc
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::CommentSection { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sections,
+            [
+                "comment-Sheet1-A1",
+                "comment-Sheet1-B2",
+                "comment-Sheet1-F7",
+                "comment-Sheet1-G12"
+            ]
+        );
+        // A1 annotates the first table, B2 the second, F7 and G12 both land in
+        // the third — the item whose cell range covers each commented cell.
+        let annotated: Vec<Vec<usize>> = children
+            .iter()
+            .map(|c| match c {
+                Node::Prov { inner, .. } => match inner.as_ref() {
+                    Node::Commented { comments, .. } => comments.clone(),
+                    _ => Vec::new(),
+                },
+                Node::Commented { comments, .. } => comments.clone(),
+                _ => Vec::new(),
+            })
+            .collect();
+        assert_eq!(annotated, vec![vec![0], vec![1], vec![2, 3]]);
+    }
+
     /// docling PR #3727: a merged full-width cell directly above a real
     /// header row is a section label — a paragraph before the table, not a
     /// swallowed header.
     #[test]
     fn section_label_splits_off_the_table() {
         let path = format!(
-            "{}/tests/data/xlsx/sources/xlsx_09_section_label_header.xlsx",
+            "{}/../../tests/data/xlsx/sources/xlsx_09_section_label_header.xlsx",
             env!("CARGO_MANIFEST_DIR")
         );
         let bytes = std::fs::read(&path).expect("fixture exists");
         let src = SourceDocument::from_bytes("x.xlsx", InputFormat::Xlsx, bytes);
         let doc = XlsxBackend::default().convert(&src).expect("converts");
-        let para = doc
-            .nodes
+        let nodes = flatten(&doc.nodes);
+        let para = nodes
             .iter()
             .position(|n| matches!(n, Node::Paragraph { text } if text == "Reading List"));
-        let table_ix = doc
-            .nodes
+        let table_ix = nodes
             .iter()
             .position(|n| matches!(n, Node::Table(_)))
             .expect("a table");
         let para = para.expect("section label emitted as a paragraph");
         assert!(para < table_ix, "label precedes the table");
-        if let Node::Table(t) = &doc.nodes[table_ix] {
+        if let Node::Table(t) = nodes[table_ix] {
             assert_eq!(t.rows[0][0], "#", "real header row leads the table");
             assert!(
                 t.rows.iter().all(|r| r[0] != "Reading List"),
@@ -941,8 +1265,8 @@ mod tests {
     }
 
     /// Binary workbook (issue #210): the visible sheet's table converts with
-    /// openpyxl-style values, the hidden sheet's lands in the invisible
-    /// furniture layer, and the second sheet trails a page break.
+    /// openpyxl-style values, the hidden sheet's group carries the invisible
+    /// content layer, and the second sheet trails a page break.
     #[test]
     fn xlsb_tables_and_hidden_sheet() {
         let path = format!(
@@ -952,8 +1276,8 @@ mod tests {
         let bytes = std::fs::read(&path).expect("fixture exists");
         let src = SourceDocument::from_bytes("x.xlsb", InputFormat::Xlsx, bytes);
         let doc = XlsxBackend::default().convert(&src).expect("converts");
-        let Some(Node::Table(sales)) = doc.nodes.iter().find(|n| matches!(n, Node::Table(_)))
-        else {
+        let nodes = flatten(&doc.nodes);
+        let Some(Node::Table(sales)) = nodes.iter().find(|n| matches!(n, Node::Table(_))) else {
             panic!("no visible table in {:?}", doc.nodes);
         };
         assert_eq!(sales.rows[0], vec!["region", "q1", "q2"]);
@@ -961,13 +1285,13 @@ mod tests {
         let hidden = doc.nodes.iter().any(|n| {
             matches!(
                 n,
-                Node::Furniture { layer: docling_core::ContentLayer::Invisible, inner }
-                    if matches!(**inner, Node::Table(_))
+                Node::Group { layer: Some(docling_core::ContentLayer::Invisible), children, .. }
+                    if children.iter().any(|c| matches!(c, Node::Table(_)))
             )
         });
         assert!(
             hidden,
-            "hidden sheet's table in the invisible layer: {:?}",
+            "hidden sheet's group on the invisible layer: {:?}",
             doc.nodes
         );
         assert!(doc.nodes.iter().any(|n| matches!(n, Node::PageBreak)));

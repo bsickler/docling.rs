@@ -8,13 +8,13 @@
 //! tables, code blocks, figures/images), inline formatting (bold, italic,
 //! inline code, links), key-value form regions (docling's `field_region`,
 //! detected from the `keyN` / `keyN_valueM` / `keyN_marker` `id`-convention),
-//! and inline visibility suppression (`hidden` / inline `display:none` /
-//! `visibility:hidden`). Out of scope for now and tracked in `docs/MIGRATION.md`:
+//! and invisible-element suppression (`hidden` / `aria-hidden` / inline
+//! `display:none` / `visibility:hidden`). Out of scope for now and tracked in `docs/MIGRATION.md`:
 //! browser rendering, rendered bounding boxes, stylesheet-driven (class/CSS
 //! cascade) visibility suppression, and the rich per-cell table provenance the
 //! Python backend computes.
 
-use docling_core::{ContentLayer, DoclingDocument, InlineRun, Node, Script, Table};
+use docling_core::{CaptionParent, ContentLayer, DoclingDocument, InlineRun, Node, Script, Table};
 use scraper::{ElementRef, Html, Node as HtmlNode, Selector};
 
 use crate::backend::images::{ImageResolver, NoFetch};
@@ -40,12 +40,74 @@ impl DeclarativeBackend for HtmlBackend {
         // The bare backend never fetches images (it's also how the Markdown
         // backend feeds in embedded raw HTML). Image fetching is wired through
         // the converter, which calls `convert_html` with a real resolver.
-        Ok(convert_html(&source.name, source.text()?, &NoFetch))
+        let html = decode_html_bytes(&source.bytes);
+        Ok(convert_html(&source.name, &html, &NoFetch))
     }
 }
 
 /// Convert an HTML document into a [`DoclingDocument`], resolving `<img>` sources
 /// through `images` (use [`NoFetch`] to leave every picture a placeholder).
+/// Decode raw HTML bytes the way docling reads them — BeautifulSoup's
+/// `UnicodeDammit` (#371): a byte-order mark wins; else the encoding the
+/// document declares (an XML declaration within the first 1024 bytes, else a
+/// `<meta charset>` / `http-equiv` charset within the first
+/// `max(2048, 5 % of the length)` bytes — bs4's search windows and regexes);
+/// else strict UTF-8; else windows-1252, which never fails. Each candidate is
+/// taken only when it decodes without error, as upstream does. The one step
+/// not reproduced is bs4's third-party detector (chardet / charset_normalizer),
+/// consulted between the declaration and the fallbacks: it is heuristic and
+/// version-dependent, and a UTF-8 or windows-1252 document — the realistic
+/// legacy inputs — never reaches it. Labels resolve through the WHATWG table
+/// (`encoding_rs`), so `iso-8859-1`/`latin1` decode as windows-1252 the way
+/// browsers do, where Python's codec would map 0x80–0x9F to C1 controls.
+pub(crate) fn decode_html_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    use encoding_rs::{Encoding, WINDOWS_1252};
+    if let Some((enc, bom_len)) = Encoding::for_bom(bytes) {
+        if let Some(text) =
+            enc.decode_without_bom_handling_and_without_replacement(&bytes[bom_len..])
+        {
+            return text;
+        }
+    }
+    if let Some(label) = declared_encoding(bytes) {
+        if let Some(enc) = Encoding::for_label(label.as_bytes()) {
+            if let Some(text) = enc.decode_without_bom_handling_and_without_replacement(bytes) {
+                return text;
+            }
+        }
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    WINDOWS_1252.decode_without_bom_handling(bytes).0
+}
+
+/// The encoding an HTML document declares, lowercased — bs4's
+/// `EncodingDetector.find_declared_encoding(is_html=True)`: the XML
+/// declaration's `encoding=` (searched in the first 1024 bytes), else the
+/// first `<meta … charset=…>` (searched in the first `max(2048, len/20)`
+/// bytes; the regex also covers `http-equiv` content-type declarations).
+fn declared_encoding(bytes: &[u8]) -> Option<String> {
+    use regex::bytes::Regex;
+    use std::sync::OnceLock;
+    static XML_RE: OnceLock<Regex> = OnceLock::new();
+    static META_RE: OnceLock<Regex> = OnceLock::new();
+    let xml_re = XML_RE.get_or_init(|| {
+        Regex::new(r#"(?i)^\s*<\?.*encoding=['"](.*?)['"].*\?>"#).expect("xml decl regex")
+    });
+    let meta_re = META_RE.get_or_init(|| {
+        Regex::new(r#"(?i)<\s*meta[^>]+charset\s*=\s*["']?([^>]*?)[ /;'">]"#).expect("meta regex")
+    });
+    let xml_end = bytes.len().min(1024);
+    let html_end = bytes.len().min(2048.max(bytes.len() / 20));
+    let found = xml_re
+        .captures(&bytes[..xml_end])
+        .or_else(|| meta_re.captures(&bytes[..html_end]))?;
+    let label = found.get(1)?.as_bytes();
+    let label = String::from_utf8_lossy(label).trim().to_ascii_lowercase();
+    (!label.is_empty()).then_some(label)
+}
+
 pub(crate) fn convert_html(name: &str, html: &str, images: &dyn ImageResolver) -> DoclingDocument {
     let mut doc = DoclingDocument::new(name);
     append_fragment(html, &mut doc.nodes, images);
@@ -139,17 +201,27 @@ fn mark_leading_furniture(nodes: &mut [Node]) {
     }
 }
 
-/// An element the page explicitly hides from rendering — the `hidden` attribute
-/// or an inline `display:none` / `visibility:hidden` style. A rendering engine
-/// (and docling's rendered output) drops these, so we suppress them too.
+/// An element the page explicitly hides from rendering — the `hidden` attribute,
+/// `aria-hidden`, or an inline `display:none` / `visibility:hidden` style. A
+/// rendering engine (and docling's rendered output) drops these, so we suppress
+/// them too.
 ///
-/// `aria-hidden="true"` is deliberately *not* treated as hidden: it removes an
-/// element from the accessibility tree but leaves it visually rendered, so a
-/// visual renderer keeps its text. Only inline styles are honored — a full CSS
-/// cascade (class/stylesheet-driven visibility, e.g. Wikipedia's collapsed
-/// menus) still needs a real browser and is out of scope.
+/// `aria-hidden` is docling's `_is_invisible_tag` rule, not a strictly visual
+/// one: the attribute only removes an element from the accessibility tree, but
+/// in practice it marks decorative duplicates (Wikipedia's `<img
+/// class="mw-logo-icon" aria-hidden="true">` beside the captioned wordmark), and
+/// docling drops them. `true`/`1`/`yes` count, as upstream. Only inline styles
+/// are honored beyond that — a full CSS cascade (class/stylesheet-driven
+/// visibility, e.g. Wikipedia's collapsed menus) still needs a real browser and
+/// is out of scope, as is docling's `_has_rendered_presence` zero-size check.
 fn is_hidden(e: &scraper::node::Element) -> bool {
     if e.attr("hidden").is_some() {
+        return true;
+    }
+    if e.attr("aria-hidden").is_some_and(|v| {
+        let v = v.trim();
+        v.eq_ignore_ascii_case("true") || v == "1" || v.eq_ignore_ascii_case("yes")
+    }) {
         return true;
     }
     e.attr("style").is_some_and(|style| {
@@ -276,6 +348,7 @@ fn walk_block(
                         caption_href: None,
                         image: img_src(e).and_then(|s| images.resolve(&s)),
                         classification: None,
+                        caption_parent: Default::default(),
                     });
                 } else if name == "signature" || name == "stamp" {
                     // docling turns these into an image annotated with the kind.
@@ -285,6 +358,7 @@ fn walk_block(
                         caption_href: None,
                         image: None,
                         classification: None,
+                        caption_parent: Default::default(),
                     });
                     let mut label = name.to_string();
                     label[..1].make_ascii_uppercase();
@@ -311,6 +385,7 @@ fn walk_block(
                             caption_href,
                             image: src.as_deref().and_then(|s| images.resolve(s)),
                             classification: None,
+                            caption_parent: Default::default(),
                         });
                     } else if has_descendant(cref, "img") || contains_block(cref) {
                         // An anchor with an image among other content (docling
@@ -319,11 +394,18 @@ fn walk_block(
                         // swallows every following block under HTML5 parsing):
                         // the wrapper is walked block-wise, so nested tables and
                         // lists come out as their own items instead of
-                        // flattening into inline text. (The anchor's own href —
-                        // if any — is not threaded through, matching the
-                        // image-wrapper branch.)
+                        // flattening into inline text. The anchor's href still
+                        // reaches the pictures it wraps (Wikipedia's logo link
+                        // holds a wordmark and a tagline image), exactly as in
+                        // the single-image branch above.
                         flush_inline(&mut inline, nodes);
+                        let start = nodes.len();
                         walk_block(cref, nodes, list_level, base, images);
+                        if let Some(href) =
+                            e.attr("href").filter(|h| !h.is_empty()).map(normalize_url)
+                        {
+                            annotate_picture_captions(&mut nodes[start..], &href);
+                        }
                     } else {
                         collect_element(cref, base, None, &mut inline);
                     }
@@ -451,19 +533,93 @@ fn handle_block(
             }
         }
         "figure" => {
-            // docling's figure handler keys off the first `<img>`: a figure
-            // without one (e.g. a `<video>` thumb) emits nothing — not even its
-            // `<figcaption>`.
-            if has_descendant(elem, "img") {
-                nodes.push(Node::Picture {
-                    caption: figure_caption(elem),
-                    // docling annotates the caption item with the first link
-                    // *inside the figcaption* (`find_parent_annotation`); the
-                    // caption text itself stays plain.
-                    caption_href: figcaption_href(elem),
-                    image: figure_img_src(elem).and_then(|s| images.resolve(&s)),
-                    classification: None,
-                });
+            // docling#4050: every child except the `<figcaption>` is dispatched
+            // (an `<img>` becomes a picture, block tags go through the block
+            // handler, inline content accumulates as text), and the caption is
+            // resolved afterwards — every picture the figure produced takes the
+            // figcaption as its caption (docling's `_emit_image` looks up the
+            // enclosing figure's figcaption); when no picture came out, the
+            // figcaption becomes a caption item of its own, attached to the
+            // figure's first item when that is a table (`TableItem.captions`).
+            let start = nodes.len();
+            let cap_text = figcaption_text(elem);
+            let cap_href = figcaption_href(elem);
+            let mut inline = RunBuf::default();
+            for child in elem.children() {
+                match child.value() {
+                    HtmlNode::Text(text) => {
+                        let run = normalize_ws(text);
+                        if !run.is_empty() {
+                            inline.md.push(serialize_run(&run, base, None));
+                            inline.push_rich(base.to_inline_run(&run));
+                        }
+                    }
+                    HtmlNode::Element(e) => {
+                        let Some(cref) = ElementRef::wrap(child) else {
+                            continue;
+                        };
+                        let name = e.name();
+                        if name == "figcaption" || is_skipped(name) || is_hidden(e) {
+                            continue;
+                        }
+                        if name == "img" {
+                            flush_inline(&mut inline, nodes);
+                            nodes.push(Node::Picture {
+                                caption: e
+                                    .attr("alt")
+                                    .filter(|a| !a.is_empty())
+                                    .map(str::to_string),
+                                caption_href: None,
+                                image: img_src(e).and_then(|s| images.resolve(&s)),
+                                classification: None,
+                                caption_parent: Default::default(),
+                            });
+                        } else if is_block(name) {
+                            flush_inline(&mut inline, nodes);
+                            handle_block(cref, name, nodes, list_level, base, images);
+                        } else if has_descendant(cref, "img") || contains_block(cref) {
+                            flush_inline(&mut inline, nodes);
+                            walk_block(cref, nodes, list_level, tag_fmt(name, base), images);
+                        } else {
+                            collect_element(cref, base, None, &mut inline);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            flush_inline(&mut inline, nodes);
+            let produced = &mut nodes[start..];
+            let mut any_picture = false;
+            for node in produced.iter_mut() {
+                if let Node::Picture {
+                    caption,
+                    caption_href,
+                    ..
+                } = node
+                {
+                    any_picture = true;
+                    if cap_text.is_some() {
+                        *caption = cap_text.clone();
+                        *caption_href = cap_href.clone();
+                    }
+                }
+            }
+            if !any_picture {
+                if let Some(text) = cap_text {
+                    match produced.first_mut() {
+                        // docling adds the table, then the figcaption under
+                        // the same parent (#390: the caption follows the
+                        // table in the container's children).
+                        Some(Node::Table(table)) => {
+                            table.caption = Some(text);
+                            table.caption_parent = CaptionParent::ContainerAfter;
+                        }
+                        _ => nodes.push(Node::Caption {
+                            text,
+                            href: cap_href,
+                        }),
+                    }
+                }
             }
         }
         "hr" => {}
@@ -1195,7 +1351,7 @@ fn collect_element(elem: ElementRef, fmt: Fmt, hyperlink: Option<&str>, runs: &m
 /// Normalize an absolute `http(s)` URL the way docling's `pydantic.AnyUrl` does:
 /// a bare scheme + host (no path) gets a trailing slash. Other URLs (relative
 /// paths, fragments) are left as-is.
-fn normalize_url(href: &str) -> String {
+pub(crate) fn normalize_url(href: &str) -> String {
     if let Some(rest) = href
         .strip_prefix("https://")
         .or_else(|| href.strip_prefix("http://"))
@@ -1254,7 +1410,7 @@ fn lang_from_class(class: &str) -> Option<String> {
     })
 }
 
-fn parse_table(table: ElementRef) -> Option<Table> {
+pub(crate) fn parse_table(table: ElementRef) -> Option<Table> {
     parse_table_cells(table, render_cell)
 }
 
@@ -1392,6 +1548,10 @@ fn parse_table_cells(
     // cell-level `column_header` (drives `<ched/>` and the chunker's dataframe
     // header detection).
     let mut th_grid: Vec<Vec<bool>> = vec![vec![false; num_cols]; num_rows];
+    // Per-cell `row_header` (docling#4216): a `<th>` labelling the rows beside
+    // it rather than the column above them — every cell of a spanning
+    // row-header row, and a lone `<th>` in a row that also holds `<td>` data.
+    let mut rh_grid: Vec<Vec<bool>> = vec![vec![false; num_cols]; num_rows];
     // Span continuations (#240): a covered position continues its anchor
     // horizontally / vertically — the source of real `TableCell` spans and
     // the DocLang `lcel`/`ucel` tokens.
@@ -1430,7 +1590,12 @@ fn parse_table_cells(
                 col += 1;
             }
             let (text, rich, cell_nodes) = render_cell(cell);
-            let is_th = cell.value().name() == "th" && all_th;
+            // docling#4216: a row-header row's cells label the rows they span
+            // into, so they are *row* headers — flagging them `column_header`
+            // (as docling did until 2.126) made docling-core 2.96 fold the
+            // first data row into the Markdown header (`Year - 2025`).
+            let is_th = all_th && !row_header;
+            let is_rh = row_header || (!all_th && cell.value().name() == "th");
             any_rich |= !cell_nodes.is_empty();
             let mut anchor_filled = false;
             for r in start_row_span..start_row_span + rowspan {
@@ -1456,6 +1621,7 @@ fn parse_table_cells(
                         }
                         anchor_filled = true;
                         th_grid[gr][gc] = is_th;
+                        rh_grid[gr][gc] = is_rh;
                         col_cont[gr][gc] = dc > 0;
                         row_cont[gr][gc] = r > start_row_span;
                     }
@@ -1474,6 +1640,7 @@ fn parse_table_cells(
         location: None,
         structure: Some(docling_core::TableStructure {
             col_header: th_grid,
+            row_header: rh_grid,
             col_continuation: col_cont,
             row_continuation: row_cont,
             ..Default::default()
@@ -1481,6 +1648,7 @@ fn parse_table_cells(
         cell_blocks: any_rich.then_some(blocks),
         cells: None,
         caption: None,
+        caption_parent: Default::default(),
     })
 }
 
@@ -1624,6 +1792,25 @@ fn image_wrapper(elem: ElementRef) -> Option<(Option<String>, Option<String>)> {
     Some((caption, src))
 }
 
+/// Hang an enclosing anchor's href on every captioned picture it wraps —
+/// docling's caption hyperlink annotation. A picture without a caption has
+/// nowhere to hang it, and one that already carries its own (a nested
+/// `<figcaption>` link) keeps it.
+fn annotate_picture_captions(nodes: &mut [Node], href: &str) {
+    for node in nodes {
+        if let Node::Picture {
+            caption: Some(_),
+            caption_href,
+            ..
+        } = node
+        {
+            if caption_href.is_none() {
+                *caption_href = Some(href.to_string());
+            }
+        }
+    }
+}
+
 /// The first `<a href>` inside a figure's `<figcaption>` — docling's caption
 /// hyperlink annotation (the caption text keeps the anchor text inline, the
 /// href rides on the caption item).
@@ -1637,6 +1824,7 @@ fn figcaption_href(fig: ElementRef) -> Option<String> {
 }
 
 /// The image URL of a `<figure>`'s first `<img>`, for image extraction.
+#[allow(dead_code)]
 fn figure_img_src(fig: ElementRef) -> Option<String> {
     fig.select(cached_selector!("img"))
         .next()
@@ -1743,30 +1931,24 @@ fn cell_richness(cell: ElementRef) -> (usize, bool) {
     (count, markup)
 }
 
-fn figure_caption(fig: ElementRef) -> Option<String> {
-    if let Some(cap) = fig.select(cached_selector!("figcaption")).next() {
-        // A figure caption is plain text (formatting/links are stripped), but
-        // docling's `to_single_text_element` builds it per source text node:
-        // each fragment is stripped and the fragments are joined with single
-        // spaces — so tag boundaries always yield a space ("a b ." for
-        // `a <a>b</a>.`, "[ 49 ]" for a cite's `[`/`49`/`]` spans).
-        let mut parts: Vec<String> = Vec::new();
-        for t in cap.text() {
-            let frag = normalize_ws(t);
-            if !frag.is_empty() {
-                parts.push(frag);
-            }
-        }
-        let text = parts.join(" ");
-        if !text.is_empty() {
-            return Some(text);
+/// The plain text of a `<figure>`'s `<figcaption>` (docling's caption
+/// `to_single_text_element`); `None` without a figcaption or when it is blank.
+fn figcaption_text(fig: ElementRef) -> Option<String> {
+    let cap = fig.select(cached_selector!("figcaption")).next()?;
+    // A figure caption is plain text (formatting/links are stripped), but
+    // docling's `to_single_text_element` builds it per source text node:
+    // each fragment is stripped and the fragments are joined with single
+    // spaces — so tag boundaries always yield a space ("a b ." for
+    // `a <a>b</a>.`, "[ 49 ]" for a cite's `[`/`49`/`]` spans).
+    let mut parts: Vec<String> = Vec::new();
+    for t in cap.text() {
+        let frag = normalize_ws(t);
+        if !frag.is_empty() {
+            parts.push(frag);
         }
     }
-    fig.select(cached_selector!("img"))
-        .next()
-        .and_then(|img| img.value().attr("alt"))
-        .filter(|a| !a.is_empty())
-        .map(str::to_string)
+    let text = parts.join(" ");
+    (!text.is_empty()).then_some(text)
 }
 
 /// Sanitize typographic Unicode to ASCII (docling's HTML text cleanup) and
@@ -1892,6 +2074,167 @@ mod tests {
         HtmlBackend.convert(&src).unwrap()
     }
 
+    fn convert_bytes(html: &[u8]) -> DoclingDocument {
+        let src = SourceDocument::from_bytes("t", InputFormat::Html, html.to_vec());
+        HtmlBackend.convert(&src).unwrap()
+    }
+
+    /// docling#4216: a `<tr>` whose `<th>`s each span several rows is a pivot
+    /// table's row-header row — its cells label the rows they span into, so
+    /// they are `row_header`, never `column_header`. Flagging them as column
+    /// headers pulled the first data row into the Markdown header block once
+    /// docling-core 2.96 started deriving that block from the flags.
+    #[test]
+    fn pivot_row_headers_are_row_headers_not_column_headers() {
+        // The row-header row spans the data rows *plus itself*, exactly as a
+        // spreadsheet export writes a pivot table (`example_08`).
+        let doc = convert(
+            "<table>\
+             <tr><th>Year</th><th>Month</th><th>Revenue</th></tr>\
+             <tr><th rowspan=3>2025</th></tr>\
+             <tr><td>January</td><td>$134</td></tr>\
+             <tr><td>February</td><td>$150</td></tr>\
+             </table>",
+        );
+        let Some(Node::Table(t)) = doc.nodes.iter().find(|n| matches!(n, Node::Table(_))) else {
+            panic!("a table");
+        };
+        let st = t.structure.as_ref().expect("structure");
+        // Only the real column titles are column headers; the spanning `2025`
+        // label is a row header replicated down its span.
+        assert_eq!(
+            st.col_header,
+            vec![vec![true, true, true], vec![false; 3], vec![false; 3]]
+        );
+        assert_eq!(
+            st.row_header,
+            vec![
+                vec![false; 3],
+                vec![true, false, false],
+                vec![true, false, false]
+            ]
+        );
+        // …so the header block stays one row and the data rows stay data.
+        assert_eq!(t.header_row_count(), 1);
+        assert_eq!(
+            doc.export_to_markdown(),
+            "|   Year | Month    | Revenue   |\n|--------|----------|-----------|\n|   2025 | January  | $134      |\n|   2025 | February | $150      |\n"
+        );
+    }
+
+    /// A `<th>` label beside `<td>` data in the same row is a row header too
+    /// (docling's `(not col_header) and <th>` branch), and contributes no
+    /// column header at all.
+    #[test]
+    fn a_th_label_beside_data_is_a_row_header() {
+        let doc = convert(
+            "<table><tr><th>Rate</th><td>5%</td></tr><tr><th>Term</th><td>3y</td></tr></table>",
+        );
+        let Some(Node::Table(t)) = doc.nodes.iter().find(|n| matches!(n, Node::Table(_))) else {
+            panic!("a table");
+        };
+        let st = t.structure.as_ref().expect("structure");
+        assert_eq!(st.col_header, vec![vec![false; 2], vec![false; 2]]);
+        assert_eq!(st.row_header, vec![vec![true, false], vec![true, false]]);
+    }
+
+    /// #371: non-UTF-8 HTML decodes like docling's BeautifulSoup does —
+    /// windows-1252 fallback without a declaration, the declared `<meta
+    /// charset>` / `http-equiv` charset when present, a BOM first of all; a
+    /// declaration nobody knows falls through to UTF-8.
+    #[test]
+    fn non_utf8_html_decodes_like_beautifulsoup() {
+        let md = convert_bytes(b"<html><body><p>caf\xe9 \x93quoted\x94</p></body></html>")
+            .export_to_markdown();
+        // (the backend's text cleanup maps the curly quotes to ASCII, as docling's does)
+        assert!(md.contains("caf\u{e9} \"quoted\""), "{md}");
+
+        let md = convert_bytes(
+            b"<html><head><meta charset=\"windows-1251\"></head><body><p>\xcf\xf0\xe8\xe2\xe5\xf2</p></body></html>",
+        )
+        .export_to_markdown();
+        assert!(
+            md.contains("\u{41f}\u{440}\u{438}\u{432}\u{435}\u{442}"),
+            "{md}"
+        );
+
+        let md = convert_bytes(
+            b"<html><head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=iso-8859-15\"></head><body><p>\xa4 5</p></body></html>",
+        )
+        .export_to_markdown();
+        assert!(md.contains("\u{20ac} 5"), "{md}");
+
+        let mut utf16 = vec![0xff, 0xfe];
+        for u in "<p>h\u{e9}</p>".encode_utf16() {
+            utf16.extend_from_slice(&u.to_le_bytes());
+        }
+        let md = convert_bytes(&utf16).export_to_markdown();
+        assert!(md.contains("h\u{e9}"), "{md}");
+
+        let md = convert_bytes(
+            "<html><head><meta charset=\"x-no-such-charset\"></head><body><p>na\u{ef}ve</p></body></html>"
+                .as_bytes(),
+        )
+        .export_to_markdown();
+        assert!(md.contains("na\u{ef}ve"), "{md}");
+
+        assert_eq!(
+            declared_encoding(b"<?xml version=\"1.0\" encoding=\"ISO-8859-2\"?><html/>").as_deref(),
+            Some("iso-8859-2")
+        );
+    }
+
+    /// docling#4050: a `<figure>` wrapping a table gets its `<figcaption>` as
+    /// the table's caption; one wrapping plain blocks emits the blocks and a
+    /// standalone caption item; one with an `<img>` keeps the picture caption.
+    #[test]
+    fn figures_dispatch_children_and_attach_captions() {
+        let doc = convert(
+            r#"<html><body>
+            <figure><table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>
+              <figcaption>Table cap <a href="https://x.y/z">link</a></figcaption></figure>
+            <figure><p>Just text</p><figcaption><a href="/w/M">Mallard</a></figcaption></figure>
+            <figure><img src="a.png" alt="alt"><figcaption>Img cap</figcaption></figure>
+            </body></html>"#,
+        );
+        let mut tables = 0;
+        for n in &doc.nodes {
+            match n {
+                Node::Table(t) => {
+                    tables += 1;
+                    assert_eq!(t.caption.as_deref(), Some("Table cap link"));
+                    // #390: docling adds the figcaption after the table, under
+                    // the table's own parent.
+                    assert_eq!(t.caption_parent, CaptionParent::ContainerAfter);
+                }
+                Node::Picture {
+                    caption,
+                    caption_parent,
+                    ..
+                } => {
+                    assert_eq!(caption.as_deref(), Some("Img cap"));
+                    // An image caption is `add_text`'s default parent, the body.
+                    assert_eq!(*caption_parent, CaptionParent::Body);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tables, 1);
+        assert!(doc.nodes.iter().any(|n| matches!(
+            n,
+            Node::Caption { text, href: Some(h) } if text == "Mallard" && h == "/w/M"
+        )));
+        let md = doc.export_to_markdown();
+        assert!(
+            md.contains("Table cap link\n\n|   A |   B |"),
+            "caption precedes the grid: {md}"
+        );
+        assert!(
+            md.contains("Just text\n\n[Mallard](/w/M)\n\nImg cap\n\n<!-- image -->"),
+            "{md}"
+        );
+    }
+
     /// #284: an *unclosed* inline tag (here `<a name>` + `<b>`) legally
     /// swallows every subsequent block under HTML5 parsing; the walker must
     /// still emit the swallowed table/list as structure, not flatten them
@@ -1995,7 +2338,46 @@ mod tests {
     }
 
     #[test]
-    fn hidden_inline_styles_are_suppressed_but_aria_hidden_is_kept() {
+    fn anchor_wrapping_several_images_hangs_its_href_on_each_caption() {
+        // Wikipedia's logo link holds a decorative icon plus a captioned
+        // wordmark and tagline; docling drops the aria-hidden icon and hangs
+        // the anchor's href on the remaining captions.
+        let doc = convert(
+            "<a href=\"/wiki/Main_Page\">\
+               <img src=\"icon.png\" alt=\"\" aria-hidden=\"true\">\
+               <img src=\"wordmark.svg\" alt=\"Wikipedia\">\
+               <img src=\"tagline.svg\" alt=\"The Free Encyclopedia\">\
+             </a>",
+        );
+        let captions: Vec<(Option<String>, Option<String>)> = doc
+            .nodes
+            .iter()
+            .filter_map(|n| match n {
+                Node::Picture {
+                    caption,
+                    caption_href,
+                    ..
+                } => Some((caption.clone(), caption_href.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            captions,
+            vec![
+                (
+                    Some("Wikipedia".to_string()),
+                    Some("/wiki/Main_Page".to_string())
+                ),
+                (
+                    Some("The Free Encyclopedia".to_string()),
+                    Some("/wiki/Main_Page".to_string())
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn hidden_elements_are_suppressed() {
         // display:none / visibility:hidden / the `hidden` attribute are not
         // rendered, so their text is dropped.
         let hidden = convert(
@@ -2005,9 +2387,15 @@ mod tests {
              <p hidden>gone3</p>",
         );
         assert_eq!(hidden.export_to_markdown(), "keep\n");
-        // aria-hidden leaves the element visually rendered, so its text stays.
-        let aria = convert("<p aria-hidden=\"true\">still shown</p>");
-        assert_eq!(aria.export_to_markdown(), "still shown\n");
+        // docling's `_is_invisible_tag` also drops aria-hidden subtrees — the
+        // decorative-duplicate case (Wikipedia's logo icon beside its wordmark).
+        let aria = convert(
+            "<p aria-hidden=\"true\">gone</p>\
+             <p aria-hidden=\"1\">gone2</p>\
+             <p aria-hidden=\"yes\">gone3</p>\
+             <p aria-hidden=\"false\">keep</p>",
+        );
+        assert_eq!(aria.export_to_markdown(), "keep\n");
     }
 
     #[test]

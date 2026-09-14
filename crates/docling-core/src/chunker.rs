@@ -269,11 +269,8 @@ impl Walker<'_> {
     fn sibling_lists(&mut self, run: &[Node]) {
         let base = level_of(&run[0]);
         let mut seg = 0;
-        let mut prev: Option<(bool, u64)> = None;
         for k in 0..run.len() {
             let Node::ListItem {
-                ordered,
-                number,
                 first_in_list,
                 level,
                 ..
@@ -284,15 +281,11 @@ impl Walker<'_> {
             if *level != base {
                 continue; // nested item — handled inside `list`
             }
-            if k > seg {
-                if let Some((po, pn)) = prev {
-                    if *first_in_list || po != *ordered || (*ordered && *number != pn + 1) {
-                        self.list(&run[seg..k]);
-                        seg = k;
-                    }
-                }
+            // The backend's list boundary, as in `json.rs::add_sibling_lists`.
+            if k > seg && *first_in_list {
+                self.list(&run[seg..k]);
+                seg = k;
             }
-            prev = Some((*ordered, *number));
         }
         self.list(&run[seg..]);
     }
@@ -393,11 +386,8 @@ impl Walker<'_> {
     fn nested_sibling_lists(&mut self, run: &[Node], out: &mut Vec<ChunkItem>) {
         let base = level_of(&run[0]);
         let mut seg = 0;
-        let mut prev: Option<(bool, u64)> = None;
         for k in 0..run.len() {
             let Node::ListItem {
-                ordered,
-                number,
                 first_in_list,
                 level,
                 ..
@@ -408,16 +398,11 @@ impl Walker<'_> {
             if *level != base {
                 continue;
             }
-            if k > seg {
-                if let Some((po, pn)) = prev {
-                    if *first_in_list || po != *ordered || (*ordered && *number != pn + 1) {
-                        self.alloc.group();
-                        self.list_refs(&run[seg..k], out);
-                        seg = k;
-                    }
-                }
+            if k > seg && *first_in_list {
+                self.alloc.group();
+                self.list_refs(&run[seg..k], out);
+                seg = k;
             }
-            prev = Some((*ordered, *number));
         }
         self.alloc.group();
         self.list_refs(&run[seg..], out);
@@ -478,6 +463,12 @@ impl Walker<'_> {
                     );
                     return;
                 }
+                self.emit_inline(text, self_ref);
+            }
+            // A standalone caption chunks like any text item (docling's chunker
+            // does not treat `caption` specially outside a table/picture).
+            Node::Caption { text, .. } => {
+                let self_ref = self.alloc.text();
                 self.emit_inline(text, self_ref);
             }
             Node::CheckboxItem { checked, text } => {
@@ -591,6 +582,9 @@ impl Walker<'_> {
                 };
                 self.emit(body, items);
             }
+            // A group on a non-body layer (a hidden spreadsheet sheet) carries
+            // no chunkable content, like every other non-body item.
+            Node::Group { layer: Some(_), .. } => {}
             Node::Group { children, .. } => {
                 // A generic group is a structural container: docling recurses
                 // into it rather than chunking it whole.
@@ -633,11 +627,14 @@ impl Walker<'_> {
                     }],
                 );
             }
-            // Layout provenance is transparent.
-            Node::Located { inner, .. } => self.one(inner),
+            // Layout provenance and comment annotations are transparent.
+            Node::Located { inner, .. }
+            | Node::Prov { inner, .. }
+            | Node::Commented { inner, .. } => self.one(inner),
             // Non-body layers and doclang-only nodes don't reach the chunker
             // (nor the JSON body).
-            Node::Furniture { .. }
+            Node::CommentSection { .. }
+            | Node::Furniture { .. }
             | Node::PageFurniture { .. }
             | Node::PageBreak
             | Node::PageInfo { .. }
@@ -741,48 +738,24 @@ fn triplet_table_text(t: &Table) -> String {
             .unwrap_or("")
     };
 
-    // Whether a cell is a column-header cell, resolving span continuations to
-    // their origin (docling's grid replicates the spanning cell, so a header
-    // spilling into the next row makes that row a header row too).
-    let cell_is_header = |r: usize, c: usize| -> bool {
-        let (mut r, mut c) = (r, c);
-        loop {
-            match &t.structure {
-                Some(s) if !s.col_header.is_empty() => {
-                    return s
-                        .col_header
-                        .get(r)
-                        .and_then(|row| row.get(c))
-                        .copied()
-                        .unwrap_or(false)
-                }
-                Some(s) => {
-                    let cont = |g: &Vec<Vec<bool>>| {
-                        g.get(r)
-                            .and_then(|row| row.get(c))
-                            .copied()
-                            .unwrap_or(false)
-                    };
-                    if r > 0 && cont(&s.row_continuation) {
-                        r -= 1;
-                        continue;
-                    }
-                    if c > 0 && cont(&s.col_continuation) {
-                        c -= 1;
-                        continue;
-                    }
-                    return if s.header_row.is_empty() {
-                        r == 0
-                    } else {
-                        s.header_row.get(r).copied().unwrap_or(false)
-                    };
-                }
-                None => return r == 0,
+    // The header block is the leading run of rows on which a column-header
+    // cell *starts* (docling-core#756): the grid replicates a spanning header
+    // into every row it covers, and the rows beneath it are data, not more
+    // header. Unlike the Markdown serializer there is no "no flags -> row 0"
+    // fallback here: pandas then gets integer column names.
+    let num_headers = {
+        let derived;
+        let cells: &[crate::TableCell] = match &t.cells {
+            Some(c) if !c.is_empty() => c,
+            _ => {
+                derived = t.derive_cells();
+                &derived
             }
-        }
+        };
+        (0..num_rows)
+            .take_while(|&r| cells.iter().any(|c| c.column_header && c.start_row == r))
+            .count()
     };
-    let row_is_header = |r: usize| (0..num_cols).any(|c| cell_is_header(r, c));
-    let num_headers = (0..num_rows).take_while(|r| row_is_header(*r)).count();
 
     // Column names: header-row texts joined per column with '.', or the integer
     // positions when there are no header rows.
@@ -1145,7 +1118,10 @@ fn block_chunk_text(node: &Node) -> String {
             format!("{mark}{}", unescape_text(text))
         }
         Node::Heading { text, .. } => unescape_text(text),
-        Node::Located { inner, .. } => block_chunk_text(inner),
+        Node::Located { inner, .. } | Node::Prov { inner, .. } | Node::Commented { inner, .. } => {
+            block_chunk_text(inner)
+        }
+        Node::Group { layer: Some(_), .. } => String::new(),
         Node::Group { children, .. } => children
             .iter()
             .map(block_chunk_text)

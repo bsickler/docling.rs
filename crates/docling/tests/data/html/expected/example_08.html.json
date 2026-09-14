@@ -158,8 +158,8 @@
             "start_col_offset_idx": 0,
             "end_col_offset_idx": 1,
             "text": "2025",
-            "column_header": true,
-            "row_header": false,
+            "column_header": false,
+            "row_header": true,
             "row_section": false,
             "fillable": false
           },
@@ -361,6 +361,7 @@
         ],
         "num_rows": 6,
         "num_cols": 4,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -425,8 +426,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -479,8 +480,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -533,8 +534,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -587,8 +588,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -641,8 +642,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -777,8 +778,8 @@
             "start_col_offset_idx": 0,
             "end_col_offset_idx": 1,
             "text": "2025",
-            "column_header": true,
-            "row_header": false,
+            "column_header": false,
+            "row_header": true,
             "row_section": false,
             "fillable": false
           },
@@ -790,8 +791,8 @@
             "start_col_offset_idx": 1,
             "end_col_offset_idx": 2,
             "text": "Q1",
-            "column_header": true,
-            "row_header": false,
+            "column_header": false,
+            "row_header": true,
             "row_section": false,
             "fillable": false
           },
@@ -920,8 +921,8 @@
             "start_col_offset_idx": 1,
             "end_col_offset_idx": 2,
             "text": "Q2",
-            "column_header": true,
-            "row_header": false,
+            "column_header": false,
+            "row_header": true,
             "row_section": false,
             "fillable": false
           },
@@ -1006,6 +1007,7 @@
         ],
         "num_rows": 6,
         "num_cols": 5,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -1083,8 +1085,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1096,8 +1098,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q1",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1150,8 +1152,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1163,8 +1165,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q1",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1217,8 +1219,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1230,8 +1232,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q1",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1284,8 +1286,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1297,8 +1299,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q2",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1351,8 +1353,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1364,8 +1366,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q2",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1500,8 +1502,8 @@
             "start_col_offset_idx": 0,
             "end_col_offset_idx": 1,
             "text": "2025",
-            "column_header": true,
-            "row_header": false,
+            "column_header": false,
+            "row_header": true,
             "row_section": false,
             "fillable": false
           },
@@ -1513,8 +1515,8 @@
             "start_col_offset_idx": 1,
             "end_col_offset_idx": 2,
             "text": "Q1",
-            "column_header": true,
-            "row_header": false,
+            "column_header": false,
+            "row_header": true,
             "row_section": false,
             "fillable": false
           },
@@ -1643,8 +1645,8 @@
             "start_col_offset_idx": 1,
             "end_col_offset_idx": 2,
             "text": "Q2",
-            "column_header": true,
-            "row_header": false,
+            "column_header": false,
+            "row_header": true,
             "row_section": false,
             "fillable": false
           },
@@ -1729,6 +1731,7 @@
         ],
         "num_rows": 6,
         "num_cols": 5,
+        "orientation": "rot_0",
         "grid": [
           [
             {
@@ -1806,8 +1809,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1819,8 +1822,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q1",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1873,8 +1876,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1886,8 +1889,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q1",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1940,8 +1943,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -1953,8 +1956,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q1",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -2007,8 +2010,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -2020,8 +2023,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q2",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -2074,8 +2077,8 @@
               "start_col_offset_idx": 0,
               "end_col_offset_idx": 1,
               "text": "2025",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },
@@ -2087,8 +2090,8 @@
               "start_col_offset_idx": 1,
               "end_col_offset_idx": 2,
               "text": "Q2",
-              "column_header": true,
-              "row_header": false,
+              "column_header": false,
+              "row_header": true,
               "row_section": false,
               "fillable": false
             },

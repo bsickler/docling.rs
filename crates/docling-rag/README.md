@@ -72,7 +72,7 @@ it can be public like `/health`.
 | Method | Path                  | Description                                     |
 |--------|-----------------------|-------------------------------------------------|
 | GET    | `/`                   | built-in search UI (no auth; static HTML)       |
-| GET    | `/health`             | liveness probe (no auth)                        |
+| GET    | `/health`             | liveness probe (no auth); `llm: true/false` + `llm_model` say whether answer synthesis is configured (`OPENROUTER_API_KEY`) — the UI greys out "LLM answer" with that reason when it is not |
 | GET    | `/api/stats`          | document / chunk counts                         |
 | GET    | `/api/documents`      | all documents with metadata + processing metrics |
 | POST   | `/api/documents`      | `?name=file.pdf` (+ optional `enrich_pictures`/`enrich_code`/`enrich_formulas=true`), raw file bytes as the body → full ingest (convert, chunk, embed); dedups identical content |
@@ -136,6 +136,13 @@ tables**.
 
 ### Advanced retrieval
 
+- **BM25** — Okapi BM25 over an in-memory **inverted index** of the chunk
+  corpus, so a query only scores the chunks that share a term with it. The
+  index is built on first use and shared by every retriever the pipeline hands
+  out; it is rebuilt when the corpus changes (document/chunk counts, or an
+  ingest/delete announcing itself) or when `RAG_BM25_K1`/`RAG_BM25_B` change.
+  Keyword search stays in Rust rather than delegating to each database's
+  full-text engine, so scores are identical on SQLite, Postgres and memory.
 - **Hybrid** — fuses dense vector search with sparse BM25 via Reciprocal Rank Fusion.
 - **Multi-Query (fusion)** — the LLM rewrites the question into several diverse
   queries; each is retrieved and the results are fused with RRF.
